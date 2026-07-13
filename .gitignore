@@ -1,0 +1,40 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/dist/
+
+# Go test & coverage
+*.test
+coverage.out
+coverage.html
+*.prof
+
+# Dependencies
+/vendor/
+
+# Teams app package (reproducible from manifest.json + icons)
+teams-app/*.zip
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.idea/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+
+# CodeGraph index
+.codegraph/

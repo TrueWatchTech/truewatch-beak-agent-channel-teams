@@ -1,0 +1,46 @@
+[
+  {
+    "name": "group_message",
+    "fixture": {
+      "name": "group_message",
+      "workspace_uuid": "ws-1",
+      "channel_uuid": "channel-1",
+      "account_uuid": "acct-1",
+      "platform": "teams",
+      "credential": {
+        "account_id": "bot-1",
+        "bot_id": "bot-1",
+        "client_id": "bot-1",
+        "client_secret": "test-client-secret"
+      },
+      "account_state": {
+        "bot_id": "bot-1"
+      },
+      "raw": {
+        "type": "message",
+        "id": "a1",
+        "serviceUrl": "https://smba.trafficmanager.net/amer/",
+        "text": "hello group",
+        "conversation": {
+          "id": "C1",
+          "conversationType": "channel"
+        },
+        "from": {
+          "id": "U_HUMAN",
+          "aadObjectId": ""
+        },
+        "recipient": {
+          "id": "bot-1"
+        }
+      }
+    },
+    "expect": {
+      "chat_type": "group",
+      "chat_id": "C1",
+      "sender_id": "U_HUMAN",
+      "text": "hello group",
+      "require_dedupe_key": true,
+      "require_message_id": true
+    }
+  }
+]

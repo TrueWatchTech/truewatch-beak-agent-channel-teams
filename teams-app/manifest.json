@@ -1,0 +1,35 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.16",
+  "version": "1.0.0",
+  "id": "70b939d7-46ae-47f3-b1bf-0cb7021b0346",
+  "developer": {
+    "name": "TrueWatch",
+    "websiteUrl": "https://truewatch.com",
+    "privacyUrl": "https://truewatch.com/privacy",
+    "termsOfUseUrl": "https://truewatch.com/terms"
+  },
+  "name": {
+    "short": "Beak Teams Bot",
+    "full": "Beak Teams Connector Test Bot"
+  },
+  "description": {
+    "short": "Beak channel connector test bot",
+    "full": "Test bot for beak-agent-channel-teams inbound/outbound."
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "accentColor": "#2A6FF3",
+  "bots": [
+    {
+      "botId": "70b939d7-46ae-47f3-b1bf-0cb7021b0346",
+      "scopes": ["personal", "team", "groupChat"],
+      "isNotificationOnly": false,
+      "supportsFiles": false
+    }
+  ],
+  "permissions": ["identity", "messageTeamMembers"],
+  "validDomains": []
+}
