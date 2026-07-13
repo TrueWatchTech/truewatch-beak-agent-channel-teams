@@ -19,6 +19,7 @@ import (
 const (
 	testKID         = "test-kid"
 	testAudience    = "test-client-id"
+	testServiceURL  = "https://smba.trafficmanager.net/amer/"
 	sentinelConfig  = "https://sentinel.local/openid-config"
 	sentinelJWKSURI = "https://sentinel.local/keys"
 )
@@ -44,11 +45,12 @@ func newJWTFixture(t *testing.T, kid string) *jwtFixture {
 	eBytes := big.NewInt(int64(key.PublicKey.E)).Bytes()
 	jwksDoc := map[string]any{
 		"keys": []map[string]any{{
-			"kty": "RSA",
-			"kid": kid,
-			"use": "sig",
-			"n":   b64url(key.PublicKey.N.Bytes()),
-			"e":   b64url(eBytes),
+			"kty":          "RSA",
+			"kid":          kid,
+			"use":          "sig",
+			"n":            b64url(key.PublicKey.N.Bytes()),
+			"e":            b64url(eBytes),
+			"endorsements": []string{"msteams"},
 		}},
 	}
 	hits := 0
@@ -102,7 +104,7 @@ func validClaims(now time.Time) map[string]any {
 		"aud":        testAudience,
 		"exp":        now.Add(time.Hour).Unix(),
 		"nbf":        now.Add(-time.Minute).Unix(),
-		"serviceurl": "https://smba.trafficmanager.net/amer/",
+		"serviceurl": testServiceURL,
 	}
 }
 
@@ -110,7 +112,7 @@ func TestVerifyWebhookToken_Valid(t *testing.T) {
 	now := time.Now().UTC()
 	f := newJWTFixture(t, testKID)
 	tok := f.signToken(t, testKID, validClaims(now))
-	err := VerifyWebhookToken(context.Background(), f.provider(), "Bearer "+tok, testAudience, "https://smba.trafficmanager.net/amer/", now)
+	err := VerifyWebhookToken(context.Background(), f.provider(), "Bearer "+tok, testAudience, testServiceURL, "msteams", now)
 	if err != nil {
 		t.Fatalf("valid token rejected: %v", err)
 	}
@@ -130,7 +132,7 @@ func TestVerifyWebhookToken_TamperedSignature(t *testing.T) {
 		first = "B"
 	}
 	tampered := tok[:dot+1] + first + sig[1:]
-	if err := VerifyWebhookToken(context.Background(), f.provider(), "Bearer "+tampered, testAudience, "", now); err == nil {
+	if err := VerifyWebhookToken(context.Background(), f.provider(), "Bearer "+tampered, testAudience, testServiceURL, "", now); err == nil {
 		t.Fatal("expected tampered signature to be rejected")
 	}
 }
@@ -141,7 +143,7 @@ func TestVerifyWebhookToken_Expired(t *testing.T) {
 	claims := validClaims(now)
 	claims["exp"] = now.Add(-time.Hour).Unix()
 	tok := f.signToken(t, testKID, claims)
-	if err := VerifyWebhookToken(context.Background(), f.provider(), "Bearer "+tok, testAudience, "", now); err == nil {
+	if err := VerifyWebhookToken(context.Background(), f.provider(), "Bearer "+tok, testAudience, testServiceURL, "", now); err == nil {
 		t.Fatal("expected expired token to be rejected")
 	}
 }
@@ -151,7 +153,7 @@ func TestVerifyWebhookToken_UnknownKid(t *testing.T) {
 	f := newJWTFixture(t, testKID)
 	// Sign with a kid the JWKS does not publish.
 	tok := f.signToken(t, "other-kid", validClaims(now))
-	if err := VerifyWebhookToken(context.Background(), f.provider(), "Bearer "+tok, testAudience, "", now); err == nil {
+	if err := VerifyWebhookToken(context.Background(), f.provider(), "Bearer "+tok, testAudience, testServiceURL, "", now); err == nil {
 		t.Fatal("expected unknown kid to be rejected")
 	}
 }
@@ -162,7 +164,7 @@ func TestVerifyWebhookToken_WrongAudience(t *testing.T) {
 	claims := validClaims(now)
 	claims["aud"] = "some-other-app"
 	tok := f.signToken(t, testKID, claims)
-	if err := VerifyWebhookToken(context.Background(), f.provider(), "Bearer "+tok, testAudience, "", now); err == nil {
+	if err := VerifyWebhookToken(context.Background(), f.provider(), "Bearer "+tok, testAudience, testServiceURL, "", now); err == nil {
 		t.Fatal("expected audience mismatch to be rejected")
 	}
 }
@@ -173,7 +175,7 @@ func TestVerifyWebhookToken_WrongIssuer(t *testing.T) {
 	claims := validClaims(now)
 	claims["iss"] = "https://evil.example.com"
 	tok := f.signToken(t, testKID, claims)
-	if err := VerifyWebhookToken(context.Background(), f.provider(), "Bearer "+tok, testAudience, "", now); err == nil {
+	if err := VerifyWebhookToken(context.Background(), f.provider(), "Bearer "+tok, testAudience, testServiceURL, "", now); err == nil {
 		t.Fatal("expected issuer mismatch to be rejected")
 	}
 }
@@ -184,7 +186,7 @@ func TestVerifyWebhookToken_CacheReused(t *testing.T) {
 	p := f.provider()
 
 	tok1 := f.signToken(t, testKID, validClaims(now))
-	if err := VerifyWebhookToken(context.Background(), p, "Bearer "+tok1, testAudience, "", now); err != nil {
+	if err := VerifyWebhookToken(context.Background(), p, "Bearer "+tok1, testAudience, testServiceURL, "", now); err != nil {
 		t.Fatalf("first verify: %v", err)
 	}
 	afterFirst := *f.hits
@@ -193,10 +195,63 @@ func TestVerifyWebhookToken_CacheReused(t *testing.T) {
 	}
 
 	tok2 := f.signToken(t, testKID, validClaims(now))
-	if err := VerifyWebhookToken(context.Background(), p, "Bearer "+tok2, testAudience, "", now); err != nil {
+	if err := VerifyWebhookToken(context.Background(), p, "Bearer "+tok2, testAudience, testServiceURL, "", now); err != nil {
 		t.Fatalf("second verify: %v", err)
 	}
 	if *f.hits != afterFirst {
 		t.Fatalf("expected cache reuse (no refetch); hits went %d -> %d", afterFirst, *f.hits)
+	}
+}
+
+func TestSharedJWKSProvider_ReusesProviderForHTTPClient(t *testing.T) {
+	client := &http.Client{Transport: testRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, nil
+	})}
+	if first, second := SharedJWKSProvider(client), SharedJWKSProvider(client); first != second {
+		t.Fatal("expected the JWKS provider cache to be shared for one HTTP client")
+	}
+}
+
+func TestVerifyWebhookToken_RequiresBearerSchemeAndExpiry(t *testing.T) {
+	now := time.Now().UTC()
+	f := newJWTFixture(t, testKID)
+	claims := validClaims(now)
+	tok := f.signToken(t, testKID, claims)
+	if err := VerifyWebhookToken(context.Background(), f.provider(), tok, testAudience, testServiceURL, "", now); err == nil {
+		t.Fatal("expected a token without Bearer scheme to be rejected")
+	}
+	delete(claims, "exp")
+	tok = f.signToken(t, testKID, claims)
+	if err := VerifyWebhookToken(context.Background(), f.provider(), "Bearer "+tok, testAudience, testServiceURL, "", now); err == nil {
+		t.Fatal("expected a token without exp to be rejected")
+	}
+}
+
+func TestVerifyWebhookToken_RequiresChannelEndorsement(t *testing.T) {
+	now := time.Now().UTC()
+	f := newJWTFixture(t, testKID)
+	tok := f.signToken(t, testKID, validClaims(now))
+	if err := VerifyWebhookToken(context.Background(), f.provider(), "Bearer "+tok, testAudience, testServiceURL, "webchat", now); err == nil {
+		t.Fatal("expected mismatched channel endorsement to be rejected")
+	}
+}
+
+func TestVerifyWebhookToken_RequiresMatchingServiceURL(t *testing.T) {
+	now := time.Now().UTC()
+	f := newJWTFixture(t, testKID)
+
+	claims := validClaims(now)
+	delete(claims, "serviceurl")
+	tok := f.signToken(t, testKID, claims)
+	if err := VerifyWebhookToken(context.Background(), f.provider(), "Bearer "+tok, testAudience, testServiceURL, "msteams", now); err == nil {
+		t.Fatal("expected a token without serviceurl to be rejected")
+	}
+
+	tok = f.signToken(t, testKID, validClaims(now))
+	if err := VerifyWebhookToken(context.Background(), f.provider(), "Bearer "+tok, testAudience, "", "msteams", now); err == nil {
+		t.Fatal("expected an activity without serviceUrl to be rejected")
+	}
+	if err := VerifyWebhookToken(context.Background(), f.provider(), "Bearer "+tok, testAudience, "https://smba.trafficmanager.net/emea/", "msteams", now); err == nil {
+		t.Fatal("expected a mismatched activity serviceUrl to be rejected")
 	}
 }

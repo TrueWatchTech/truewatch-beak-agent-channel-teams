@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/TrueWatch/beak-agent-channel-teams/sdk"
+	"github.com/TrueWatchTech/truewatch-beak-agent-channel-teams/sdk"
 )
 
 // TestScenario_DirectAndGroupDoNotShareSession: the same account receiving a

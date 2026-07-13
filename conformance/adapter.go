@@ -10,8 +10,8 @@ import (
 	"strings"
 	"sync"
 
-	beakteams "github.com/TrueWatch/beak-agent-channel-teams"
-	"github.com/TrueWatch/beak-agent-channel-teams/sdk"
+	beakteams "github.com/TrueWatchTech/truewatch-beak-agent-channel-teams"
+	"github.com/TrueWatchTech/truewatch-beak-agent-channel-teams/sdk"
 	conformance "gitlab.jiagouyun.com/guance/beak-agent-channel-sdk/beak-channel-sdk-conformance"
 )
 
@@ -34,14 +34,16 @@ func (a *adapter) Metadata() conformance.ConnectorMetadata {
 		Label:       m.Label,
 		Description: m.Description,
 		Capabilities: conformance.Capabilities{
-			LoginModes:     m.Capabilities.LoginModes,
-			Text:           m.Capabilities.Text,
-			Media:          m.Capabilities.Media,
-			GroupChat:      m.Capabilities.GroupChat,
-			DirectChat:     m.Capabilities.DirectChat,
-			Stream:         m.Capabilities.Stream,
-			Webhook:        m.Capabilities.Webhook,
-			BlockStreaming: m.Capabilities.BlockStreaming,
+			LoginModes:       m.Capabilities.LoginModes,
+			Text:             m.Capabilities.Text,
+			Media:            m.Capabilities.Media,
+			GroupChat:        m.Capabilities.GroupChat,
+			DirectChat:       m.Capabilities.DirectChat,
+			Stream:           m.Capabilities.Stream,
+			Webhook:          m.Capabilities.Webhook,
+			BlockStreaming:   m.Capabilities.BlockStreaming,
+			AckModes:         m.Capabilities.AckModes,
+			RuntimeOwnership: m.Capabilities.RuntimeOwnership,
 		},
 	}
 }
@@ -122,22 +124,83 @@ func (a *adapter) ParseInbound(ctx context.Context, fixture conformance.InboundF
 	in := result.Inbound
 	return []conformance.InboundMessage{
 		{
-			WorkspaceUUID: in.WorkspaceUUID,
-			Platform:      in.Platform,
-			AccountUUID:   in.AccountUUID,
-			ChannelUUID:   in.ChannelUUID,
-			ChatType:      in.ChatType,
-			ChatID:        in.ChatID,
-			ThreadID:      in.ThreadID,
-			SenderID:      in.SenderID,
-			MessageID:     in.MessageID,
-			Text:          in.Text,
-			DedupeKey:     in.DedupeKey,
-			Mentions:      convertMentions(in.Mentions),
-			MentionedMe:   in.MentionedMe,
-			MentionAll:    in.MentionAll,
-			Raw:           in.Raw,
+			WorkspaceUUID:   in.WorkspaceUUID,
+			Platform:        in.Platform,
+			AccountUUID:     in.AccountUUID,
+			ChannelUUID:     in.ChannelUUID,
+			ChatType:        in.ChatType,
+			ChatID:          in.ChatID,
+			ThreadID:        in.ThreadID,
+			ChatDisplayName: in.ChatDisplayName,
+			ChatAvatarURL:   in.ChatAvatarURL,
+			ChatIdentity: conformance.ChatIdentity{
+				ID:          in.ChatIdentity.ID,
+				IDType:      in.ChatIdentity.IDType,
+				Type:        in.ChatIdentity.Type,
+				DisplayName: in.ChatIdentity.DisplayName,
+				AvatarURL:   in.ChatIdentity.AvatarURL,
+			},
+			SenderID:          in.SenderID,
+			SenderDisplayName: in.SenderDisplayName,
+			MessageID:         in.MessageID,
+			Text:              in.Text,
+			ReferencedMessage: convertReferencedMessage(in.ReferencedMessage),
+			DedupeKey:         in.DedupeKey,
+			Mentions:          convertMentions(in.Mentions),
+			MentionedMe:       in.MentionedMe,
+			MentionAll:        in.MentionAll,
+			Raw:               in.Raw,
 		}}, nil
+}
+
+func convertReferencedMessage(ref *sdk.ReferencedMessage) *conformance.ReferencedMessage {
+	if ref == nil {
+		return nil
+	}
+	return &conformance.ReferencedMessage{
+		Platform:          ref.Platform,
+		MessageID:         ref.MessageID,
+		ChatType:          ref.ChatType,
+		ChatID:            ref.ChatID,
+		ThreadID:          ref.ThreadID,
+		RootID:            ref.RootID,
+		SenderID:          ref.SenderID,
+		SenderDisplayName: ref.SenderDisplayName,
+		MessageType:       ref.MessageType,
+		Text:              ref.Text,
+		CreatedAt:         ref.CreatedAt,
+		Raw:               ref.Raw,
+	}
+}
+
+func (a *adapter) Acknowledge(ctx context.Context, req conformance.OutboundAck) (*conformance.AckResult, error) {
+	result, err := a.conn.Acknowledge(ctx, sdk.Runtime{}, sdk.OutboundAck{
+		WorkspaceUUID:     req.WorkspaceUUID,
+		Platform:          req.Platform,
+		AccountUUID:       req.AccountUUID,
+		ChannelUUID:       req.ChannelUUID,
+		SessionUUID:       req.SessionUUID,
+		SourceMessageUUID: req.SourceMessageUUID,
+		ChatType:          req.ChatType,
+		ChatID:            req.ChatID,
+		TargetMessageID:   req.TargetMessageID,
+		Intent:            req.Intent,
+		Action:            req.Action,
+		Mode:              req.Mode,
+		Emoji:             req.Emoji,
+		Raw:               req.Raw,
+	})
+	if err != nil || result == nil {
+		return nil, err
+	}
+	return &conformance.AckResult{
+		Platform:    result.Platform,
+		AccountUUID: result.AccountUUID,
+		Mode:        result.Mode,
+		Status:      result.Status,
+		ReactionID:  result.ReactionID,
+		Raw:         result.Raw,
+	}, nil
 }
 
 func convertMentions(mentions []sdk.MentionIdentity) []conformance.MentionIdentity {

@@ -1,44 +1,170 @@
 [
   {
-    "name": "group_message",
+    "name": "direct_message_with_identity",
     "fixture": {
-      "name": "group_message",
       "workspace_uuid": "ws-1",
       "channel_uuid": "channel-1",
       "account_uuid": "acct-1",
       "platform": "teams",
       "credential": {
-        "account_id": "bot-1",
-        "bot_id": "bot-1",
-        "client_id": "bot-1",
+        "account_id": "app-id",
+        "bot_id": "app-id",
+        "client_id": "app-id",
         "client_secret": "test-client-secret"
       },
-      "account_state": {
-        "bot_id": "bot-1"
-      },
+      "account_state": {"bot_id": "app-id"},
       "raw": {
         "type": "message",
-        "id": "a1",
+        "id": "direct-1",
+        "channelId": "msteams",
         "serviceUrl": "https://smba.trafficmanager.net/amer/",
-        "text": "hello group",
-        "conversation": {
-          "id": "C1",
-          "conversationType": "channel"
-        },
-        "from": {
-          "id": "U_HUMAN",
-          "aadObjectId": ""
-        },
-        "recipient": {
-          "id": "bot-1"
-        }
+        "text": "hello direct",
+        "conversation": {"id": "D1", "name": "Alice", "conversationType": "personal"},
+        "from": {"id": "29:alice", "aadObjectId": "aad-alice", "name": "Alice"},
+        "recipient": {"id": "28:app-id", "name": "Beak Bot"}
+      }
+    },
+    "expect": {
+      "chat_type": "direct",
+      "chat_id": "D1",
+      "chat_display_name": "Alice",
+      "chat_identity_id": "D1",
+      "sender_id": "aad-alice",
+      "sender_display_name": "Alice",
+      "text": "hello direct",
+      "require_dedupe_key": true,
+      "require_message_id": true
+    }
+  },
+  {
+    "name": "group_real_bot_mention",
+    "fixture": {
+      "workspace_uuid": "ws-1",
+      "channel_uuid": "channel-1",
+      "account_uuid": "acct-1",
+      "platform": "teams",
+      "credential": {"account_id": "app-id", "bot_id": "app-id", "client_id": "app-id", "client_secret": "test-client-secret"},
+      "account_state": {"bot_id": "app-id"},
+      "raw": {
+        "type": "message",
+        "id": "mention-1",
+        "channelId": "msteams",
+        "serviceUrl": "https://smba.trafficmanager.net/amer/",
+        "text": "<at>Beak Bot</at> hello group",
+        "conversation": {"id": "C1", "conversationType": "channel"},
+        "from": {"id": "29:alice", "name": "Alice"},
+        "recipient": {"id": "28:app-id", "name": "Beak Bot"},
+        "entities": [{"type": "mention", "text": "<at>Beak Bot</at>", "mentioned": {"id": "28:app-id", "name": "Beak Bot"}}]
       }
     },
     "expect": {
       "chat_type": "group",
       "chat_id": "C1",
-      "sender_id": "U_HUMAN",
+      "sender_id": "29:alice",
       "text": "hello group",
+      "mentioned_me": true,
+      "mention_ids": ["28:app-id"],
+      "require_dedupe_key": true,
+      "require_message_id": true
+    }
+  },
+  {
+    "name": "mention_only_follow_up",
+    "fixture": {
+      "workspace_uuid": "ws-1",
+      "channel_uuid": "channel-1",
+      "account_uuid": "acct-1",
+      "platform": "teams",
+      "credential": {"account_id": "app-id", "client_id": "app-id", "client_secret": "test-client-secret"},
+      "raw": {
+        "type": "message",
+        "id": "mention-only-1",
+        "serviceUrl": "https://smba.trafficmanager.net/amer/",
+        "text": "<at>Beak Bot</at>",
+        "conversation": {"id": "C1", "conversationType": "channel"},
+        "from": {"id": "29:alice"},
+        "recipient": {"id": "28:app-id"},
+        "entities": [{"type": "mention", "text": "<at>Beak Bot</at>", "mentioned": {"id": "28:app-id", "name": "Beak Bot"}}]
+      }
+    },
+    "expect": {
+      "chat_type": "group",
+      "chat_id": "C1",
+      "sender_id": "29:alice",
+      "text_trimmed_empty": true,
+      "mentioned_me": true,
+      "mention_ids": ["28:app-id"],
+      "require_dedupe_key": true
+    }
+  },
+  {
+    "name": "other_user_mention_is_not_bot_mention",
+    "fixture": {
+      "workspace_uuid": "ws-1",
+      "channel_uuid": "channel-1",
+      "account_uuid": "acct-1",
+      "platform": "teams",
+      "credential": {"account_id": "app-id", "client_id": "app-id", "client_secret": "test-client-secret"},
+      "raw": {
+        "type": "message",
+        "id": "mention-other-1",
+        "serviceUrl": "https://smba.trafficmanager.net/amer/",
+        "text": "<at>Bob</at> check",
+        "conversation": {"id": "C1", "conversationType": "channel"},
+        "from": {"id": "29:alice"},
+        "recipient": {"id": "28:app-id"},
+        "entities": [{"type": "mention", "text": "<at>Bob</at>", "mentioned": {"id": "29:bob", "name": "Bob"}}]
+      }
+    },
+    "expect": {
+      "chat_type": "group",
+      "chat_id": "C1",
+      "sender_id": "29:alice",
+      "text": "<at>Bob</at> check",
+      "mentioned_me": false,
+      "mention_ids": ["29:bob"]
+    }
+  },
+  {
+    "name": "adaptive_card_reply_common_fields",
+    "fixture": {
+      "workspace_uuid": "ws-1",
+      "channel_uuid": "channel-1",
+      "account_uuid": "acct-1",
+      "platform": "teams",
+      "credential": {"account_id": "app-id", "client_id": "app-id", "client_secret": "test-client-secret"},
+      "raw": {
+        "type": "message",
+        "id": "card-1",
+        "serviceUrl": "https://smba.trafficmanager.net/amer/",
+        "replyToId": "parent-1",
+        "conversation": {"id": "C1", "name": "Operations", "conversationType": "channel"},
+        "channelData": {"team": {"id": "team-1", "name": "SRE"}, "channel": {"id": "channel-1", "name": "Alerts"}},
+        "from": {"id": "29:alice", "name": "Alice"},
+        "recipient": {"id": "28:app-id"},
+        "attachments": [{
+          "contentType": "application/vnd.microsoft.card.adaptive",
+          "content": {"type": "AdaptiveCard", "body": [{"type": "TextBlock", "text": "CPU alert"}, {"type": "FactSet", "facts": [{"title": "Host", "value": "api-1"}]}]}
+        }]
+      }
+    },
+    "expect": {
+      "chat_type": "group",
+      "chat_id": "C1",
+      "thread_id": "parent-1",
+      "chat_display_name": "Alerts",
+      "chat_identity_id": "C1",
+      "sender_id": "29:alice",
+      "sender_display_name": "Alice",
+      "text": "CPU alert\nHost\napi-1",
+      "referenced_message": {
+        "platform": "teams",
+        "message_id": "parent-1",
+        "chat_type": "group",
+        "chat_id": "C1",
+        "thread_id": "parent-1",
+        "message_type": "message"
+      },
       "require_dedupe_key": true,
       "require_message_id": true
     }

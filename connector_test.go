@@ -2,11 +2,12 @@ package beakteams
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
 
-	"github.com/TrueWatch/beak-agent-channel-teams/sdk"
+	"github.com/TrueWatchTech/truewatch-beak-agent-channel-teams/sdk"
 )
 
 func TestConnectorImplementsInterface(t *testing.T) {
@@ -79,6 +80,12 @@ func TestValidateCredential_Success(t *testing.T) {
 	}
 	if res.State["bot_id"] != testClientID {
 		t.Fatalf("bot identity not persisted to state: %#v", res.State)
+	}
+	if res.State["bot_user_id"] != "28:"+testClientID {
+		t.Fatalf("channel bot identity not persisted to state: %#v", res.State)
+	}
+	if identities, ok := res.State["bot_identities"].([]map[string]any); !ok || len(identities) != 2 {
+		t.Fatalf("expected app and channel bot identities, got %#v", res.State["bot_identities"])
 	}
 }
 
@@ -259,6 +266,100 @@ func TestInbound_SavesState(t *testing.T) {
 	if len(refs) == 0 || len(urls) == 0 {
 		t.Fatalf("expected conversation_references and service_urls persisted, got %#v", saved)
 	}
+	if saved[sdk.RuntimeHealthKeyStreamConnectionState] != sdk.RuntimeHealthStateConnected {
+		t.Fatalf("expected connected health state, got %#v", saved)
+	}
+	if saved[sdk.RuntimeHealthKeyStreamLastEventAt] == nil {
+		t.Fatalf("expected last event timestamp, got %#v", saved)
+	}
+}
+
+func TestInbound_UsesRecipientIdentityForMentionAndKeepsMentionOnly(t *testing.T) {
+	c := Connector{}
+	account := teamsAccount("acct-1", "app-id")
+	body, _ := json.Marshal(map[string]any{
+		"type": "message", "id": "mention-1", "channelId": "msteams",
+		"serviceUrl": testServiceURL, "text": "<at>Beak Bot</at>",
+		"conversation": map[string]any{"id": "C1", "conversationType": "channel"},
+		"from":         map[string]any{"id": "29:user", "name": "Alice"},
+		"recipient":    map[string]any{"id": "28:app-id", "name": "Beak Bot"},
+		"entities": []map[string]any{{
+			"type": "mention", "text": "<at>Beak Bot</at>",
+			"mentioned": map[string]any{"id": "28:app-id", "name": "Beak Bot"},
+		}},
+	})
+	res, err := c.HandleWebhook(context.Background(), makeRuntime(&fakeSDKGateway{}, newFakeSDKAccountStore()), account, body)
+	if err != nil {
+		t.Fatalf("handle webhook: %v", err)
+	}
+	if res.Ignored || res.Inbound == nil {
+		t.Fatalf("mention-only message must reach Beak: %#v", res)
+	}
+	if !res.Inbound.MentionedMe || res.Inbound.Text != "" {
+		t.Fatalf("expected bot mention stripped while preserving follow-up event: %#v", res.Inbound)
+	}
+	if len(res.Inbound.Mentions) != 1 || res.Inbound.Mentions[0].ID != "28:app-id" {
+		t.Fatalf("expected normalized mentions, got %#v", res.Inbound.Mentions)
+	}
+}
+
+func TestInbound_OtherMentionDoesNotMentionBot(t *testing.T) {
+	c := Connector{}
+	body, _ := json.Marshal(map[string]any{
+		"type": "message", "id": "mention-2", "serviceUrl": testServiceURL,
+		"text":         "<at>Alice</at> please check",
+		"conversation": map[string]any{"id": "C1", "conversationType": "channel"},
+		"from":         map[string]any{"id": "29:user-2"},
+		"recipient":    map[string]any{"id": "28:app-id"},
+		"entities": []map[string]any{{
+			"type": "mention", "text": "<at>Alice</at>",
+			"mentioned": map[string]any{"id": "29:alice", "name": "Alice"},
+		}},
+	})
+	res, err := c.HandleWebhook(context.Background(), makeRuntime(&fakeSDKGateway{}, newFakeSDKAccountStore()), teamsAccount("acct-1", "app-id"), body)
+	if err != nil {
+		t.Fatalf("handle webhook: %v", err)
+	}
+	if res.Inbound == nil || res.Inbound.MentionedMe {
+		t.Fatalf("another user's mention must not imply MentionedMe: %#v", res.Inbound)
+	}
+	if res.Inbound.Text != "<at>Alice</at> please check" {
+		t.Fatalf("other mentions must remain in text, got %q", res.Inbound.Text)
+	}
+}
+
+func TestInbound_CardTextNamesAndReferenceUseCommonFields(t *testing.T) {
+	c := Connector{}
+	gw := &fakeSDKGateway{}
+	body, _ := json.Marshal(map[string]any{
+		"type": "message", "id": "card-1", "serviceUrl": testServiceURL,
+		"replyToId":    "parent-1",
+		"conversation": map[string]any{"id": "C1", "name": "Operations", "conversationType": "channel"},
+		"channelData":  map[string]any{"team": map[string]any{"id": "team-1", "name": "SRE"}, "channel": map[string]any{"id": "channel-1", "name": "Alerts"}},
+		"from":         map[string]any{"id": "29:user", "aadObjectId": "aad-user", "name": "Alice"},
+		"recipient":    map[string]any{"id": "28:app-id"},
+		"attachments": []map[string]any{{
+			"contentType": "application/vnd.microsoft.card.adaptive",
+			"content":     map[string]any{"type": "AdaptiveCard", "body": []map[string]any{{"type": "TextBlock", "text": "CPU alert"}, {"type": "FactSet", "facts": []map[string]any{{"title": "Host", "value": "api-1"}}}}},
+		}},
+	})
+	res, err := c.HandleWebhook(context.Background(), makeRuntime(gw, newFakeSDKAccountStore()), teamsAccount("acct-1", "app-id"), body)
+	if err != nil {
+		t.Fatalf("handle webhook: %v", err)
+	}
+	in := res.Inbound
+	if in == nil || !strings.Contains(in.Text, "CPU alert") || !strings.Contains(in.Text, "api-1") {
+		t.Fatalf("expected adaptive card text, got %#v", in)
+	}
+	if in.ChatDisplayName != "Alerts" || in.SenderDisplayName != "Alice" || in.ChatIdentity.ID != "C1" {
+		t.Fatalf("expected common chat/sender identity fields, got %#v", in)
+	}
+	if in.ThreadID != "parent-1" || in.ReferencedMessage == nil || in.ReferencedMessage.MessageID != "parent-1" {
+		t.Fatalf("expected common reference/thread fields, got %#v", in)
+	}
+	if len(gw.chatSessions) != 1 || gw.chatSessions[0].ThreadID != "parent-1" || gw.chatSessions[0].ChatDisplayName != "Alerts" {
+		t.Fatalf("common session request lost thread/name: %#v", gw.chatSessions)
+	}
 }
 
 func TestSend_Text(t *testing.T) {
@@ -287,6 +388,57 @@ func TestSend_Text(t *testing.T) {
 	}
 	if res.MessageID != "act-1" {
 		t.Fatalf("message id=%q want act-1", res.MessageID)
+	}
+}
+
+func TestSend_ThreadAndMentionMappedToTeamsActivity(t *testing.T) {
+	c := Connector{}
+	account := teamsAccount("acct-1", "app-id")
+	store := newFakeSDKAccountStore()
+	rt := makeRuntime(&fakeSDKGateway{}, store, account)
+	var sentPath string
+	var sent map[string]any
+	rt.HTTPClient = &http.Client{Transport: testRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.Contains(req.URL.Path, "/oauth2/v2.0/token") {
+			return testJSONResponse(tokenOK())
+		}
+		sentPath = req.URL.Path
+		if err := json.NewDecoder(req.Body).Decode(&sent); err != nil {
+			t.Fatalf("decode outbound: %v", err)
+		}
+		return testJSONResponse(map[string]any{"id": "reply-1"})
+	})}
+	if _, err := c.HandleWebhook(context.Background(), rt, account, activityBody(teamsActivity{
+		Type: "message", ID: "seed-thread", ServiceURL: testServiceURL, Text: "seed",
+		ConversationID: "C1", ConversationType: "channel", FromID: "29:user",
+	})); err != nil {
+		t.Fatalf("seed inbound: %v", err)
+	}
+	_, err := c.Send(context.Background(), rt, sdk.OutboundMessage{
+		AccountUUID: "acct-1", ChatID: "C1", ThreadID: "parent-1", Text: "checking",
+		Mentions: []sdk.MentionIdentity{{ID: "29:alice", DisplayName: "Alice"}},
+	})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if !strings.HasSuffix(sentPath, "/activities/parent-1") || sent["replyToId"] != "parent-1" {
+		t.Fatalf("thread reply not mapped: path=%q payload=%#v", sentPath, sent)
+	}
+	if !strings.Contains(stringValue(sent["text"]), "<at>Alice</at>") {
+		t.Fatalf("mention markup missing: %#v", sent)
+	}
+	if entities, ok := sent["entities"].([]any); !ok || len(entities) != 1 {
+		t.Fatalf("mention entity missing: %#v", sent)
+	}
+}
+
+func TestAcknowledge_ExplicitlyUnsupported(t *testing.T) {
+	result, err := (Connector{}).Acknowledge(context.Background(), sdk.Runtime{}, sdk.OutboundAck{AccountUUID: "acct-1", Mode: "reaction"})
+	if err != nil {
+		t.Fatalf("acknowledge: %v", err)
+	}
+	if result.Status != "unsupported" || result.Platform != Platform || result.AccountUUID != "acct-1" {
+		t.Fatalf("unexpected ack result: %#v", result)
 	}
 }
 

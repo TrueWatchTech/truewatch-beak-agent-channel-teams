@@ -27,6 +27,8 @@ type tokenResponse struct {
 // Conversation is the Bot Framework conversation account on an Activity.
 type Conversation struct {
 	ID               string `json:"id"`
+	Name             string `json:"name"`
+	IsGroup          bool   `json:"isGroup"`
 	ConversationType string `json:"conversationType"`
 	TenantID         string `json:"tenantId"`
 }
@@ -43,19 +45,44 @@ type ChannelAccount struct {
 type Activity struct {
 	Type         string            `json:"type"`
 	ID           string            `json:"id"`
+	ChannelID    string            `json:"channelId"`
 	ServiceURL   string            `json:"serviceUrl"`
+	ReplyToID    string            `json:"replyToId"`
+	Locale       string            `json:"locale"`
 	Text         string            `json:"text"`
 	TextFormat   string            `json:"textFormat"`
 	Conversation Conversation      `json:"conversation"`
 	From         ChannelAccount    `json:"from"`
 	Recipient    ChannelAccount    `json:"recipient"`
 	Entities     []json.RawMessage `json:"entities"`
+	Attachments  []Attachment      `json:"attachments"`
+	Value        json.RawMessage   `json:"value"`
+	ChannelData  ChannelData       `json:"channelData"`
 }
 
-// mentionEntity models a Bot Framework "mention" entity inside Activity.Entities.
-type mentionEntity struct {
+type ChannelData struct {
+	Tenant  ChannelInfo `json:"tenant"`
+	Team    ChannelInfo `json:"team"`
+	Channel ChannelInfo `json:"channel"`
+}
+
+type ChannelInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type Attachment struct {
+	ContentType string          `json:"contentType"`
+	ContentURL  string          `json:"contentUrl"`
+	Name        string          `json:"name"`
+	Content     json.RawMessage `json:"content"`
+}
+
+// MentionEntity models a Bot Framework "mention" entity inside Activity.Entities.
+type MentionEntity struct {
 	Type      string         `json:"type"`
 	Mentioned ChannelAccount `json:"mentioned"`
+	Text      string         `json:"text"`
 }
 
 // sendActivityResponse is the response from POSTing an activity to the connector
@@ -78,10 +105,11 @@ type jwks struct {
 // jwk is a single JSON Web Key. For RSA signing keys, n/e are base64url-encoded
 // big-endian integers (the modulus and public exponent).
 type jwk struct {
-	Kty string   `json:"kty"`
-	Kid string   `json:"kid"`
-	Use string   `json:"use"`
-	N   string   `json:"n"`
-	E   string   `json:"e"`
-	X5C []string `json:"x5c"`
+	Kty          string   `json:"kty"`
+	Kid          string   `json:"kid"`
+	Use          string   `json:"use"`
+	N            string   `json:"n"`
+	E            string   `json:"e"`
+	X5C          []string `json:"x5c"`
+	Endorsements []string `json:"endorsements"`
 }

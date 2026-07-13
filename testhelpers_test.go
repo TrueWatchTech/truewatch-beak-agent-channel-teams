@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/TrueWatch/beak-agent-channel-teams/sdk"
+	"github.com/TrueWatchTech/truewatch-beak-agent-channel-teams/sdk"
 )
 
 const (

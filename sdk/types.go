@@ -14,6 +14,13 @@ const (
 
 	LoginModeQRCode     = "qr_code"
 	LoginModeCredential = "credential"
+
+	RuntimeOwnershipHostStream = "host_stream"
+	RuntimeOwnershipSDKOwned   = "sdk_owned"
+
+	StreamMessageTypeText   = 1
+	StreamMessageTypeBinary = 2
+	StreamMessageTypePing   = 9
 )
 
 type Connector interface {
@@ -24,6 +31,7 @@ type Connector interface {
 	PollLogin(ctx context.Context, req LoginPollRequest) (*LoginStatus, error)
 	Start(ctx context.Context, runtime Runtime) error
 	Send(ctx context.Context, runtime Runtime, req OutboundMessage) (*SendResult, error)
+	Acknowledge(ctx context.Context, runtime Runtime, req OutboundAck) (*AckResult, error)
 	Stop(ctx context.Context, account ChannelAccount) error
 }
 
@@ -31,6 +39,62 @@ type WebhookResponse struct {
 	StatusCode int
 	Headers    map[string]string
 	Body       []byte
+}
+
+// HostStreamConnector is implemented by SDKs whose platform stream connection is
+// owned by the Beak host while platform endpoint and frame semantics stay inside
+// the SDK. Implementations must not start their own long-running reconnect loop.
+type HostStreamConnector interface {
+	ConnectStream(ctx context.Context, runtime Runtime, account ChannelAccount) (*StreamConnectResult, error)
+	BuildStreamPing(ctx context.Context, req StreamPingRequest) (*StreamFrame, error)
+	HandleStreamFrame(ctx context.Context, runtime Runtime, account ChannelAccount, req StreamFrameRequest) (*StreamFrameResult, error)
+}
+
+type StreamConnectResult struct {
+	URL             string
+	Headers         map[string]string
+	ServiceID       string
+	ReadMessageType int
+	PingInterval    time.Duration
+	PongTimeout     time.Duration
+	State           any
+	HealthUpdates   map[string]any
+}
+
+type StreamPingRequest struct {
+	ServiceID string
+	State     any
+}
+
+type StreamFrameRequest struct {
+	MessageType int
+	Data        []byte
+	ServiceID   string
+	State       any
+}
+
+type StreamFrame struct {
+	MessageType int
+	Data        []byte
+}
+
+type StreamFrameResult struct {
+	ResponseFrames []StreamFrame
+	HealthUpdates  map[string]any
+	EventResult    *StreamEventResult
+	CloseReason    string
+	PingInterval   time.Duration
+	PongTimeout    time.Duration
+	State          any
+}
+
+type StreamEventResult struct {
+	Type        string          `json:"type"`
+	Ignored     bool            `json:"ignored,omitempty"`
+	Reason      string          `json:"reason,omitempty"`
+	SessionUUID string          `json:"session_uuid,omitempty"`
+	MessageUUID string          `json:"message_uuid,omitempty"`
+	Inbound     *InboundMessage `json:"inbound,omitempty"`
 }
 
 type ConnectorMetadata struct {
@@ -42,14 +106,16 @@ type ConnectorMetadata struct {
 }
 
 type Capabilities struct {
-	LoginModes     []string `json:"login_modes"`
-	Text           bool     `json:"text"`
-	Media          bool     `json:"media"`
-	GroupChat      bool     `json:"group_chat"`
-	DirectChat     bool     `json:"direct_chat"`
-	Stream         bool     `json:"stream"`
-	Webhook        bool     `json:"webhook"`
-	BlockStreaming bool     `json:"block_streaming"`
+	LoginModes       []string `json:"login_modes"`
+	Text             bool     `json:"text"`
+	Media            bool     `json:"media"`
+	GroupChat        bool     `json:"group_chat"`
+	DirectChat       bool     `json:"direct_chat"`
+	Stream           bool     `json:"stream"`
+	Webhook          bool     `json:"webhook"`
+	BlockStreaming   bool     `json:"block_streaming"`
+	AckModes         []string `json:"ack_modes,omitempty"`
+	RuntimeOwnership string   `json:"runtime_ownership,omitempty"`
 }
 
 type CredentialSchema struct {
@@ -168,27 +234,55 @@ type LoginStatus struct {
 }
 
 type InboundMessage struct {
-	WorkspaceUUID string            `json:"workspace_uuid"`
-	Platform      string            `json:"platform"`
-	AccountUUID   string            `json:"account_uuid"`
-	ChannelUUID   string            `json:"channel_uuid"`
-	ChatType      string            `json:"chat_type"`
-	ChatID        string            `json:"chat_id"`
-	ThreadID      string            `json:"thread_id,omitempty"`
-	SenderID      string            `json:"sender_id"`
-	MessageID     string            `json:"message_id,omitempty"`
-	Text          string            `json:"text"`
-	DedupeKey     string            `json:"dedupe_key,omitempty"`
-	Mentions      []MentionIdentity `json:"mentions,omitempty"`
-	MentionedMe   bool              `json:"mentioned_me,omitempty"`
-	MentionAll    bool              `json:"mention_all,omitempty"`
-	Raw           map[string]any    `json:"raw,omitempty"`
+	WorkspaceUUID     string             `json:"workspace_uuid"`
+	Platform          string             `json:"platform"`
+	AccountUUID       string             `json:"account_uuid"`
+	ChannelUUID       string             `json:"channel_uuid"`
+	ChatType          string             `json:"chat_type"`
+	ChatID            string             `json:"chat_id"`
+	ThreadID          string             `json:"thread_id,omitempty"`
+	ChatDisplayName   string             `json:"chat_display_name,omitempty"`
+	ChatAvatarURL     string             `json:"chat_avatar_url,omitempty"`
+	ChatIdentity      ChatIdentity       `json:"chat_identity,omitempty"`
+	SenderID          string             `json:"sender_id"`
+	SenderDisplayName string             `json:"sender_display_name,omitempty"`
+	MessageID         string             `json:"message_id,omitempty"`
+	Text              string             `json:"text"`
+	ReferencedMessage *ReferencedMessage `json:"referenced_message,omitempty"`
+	DedupeKey         string             `json:"dedupe_key,omitempty"`
+	Mentions          []MentionIdentity  `json:"mentions,omitempty"`
+	MentionedMe       bool               `json:"mentioned_me,omitempty"`
+	MentionAll        bool               `json:"mention_all,omitempty"`
+	Raw               map[string]any     `json:"raw,omitempty"`
+}
+
+type ReferencedMessage struct {
+	Platform          string         `json:"platform,omitempty"`
+	MessageID         string         `json:"message_id,omitempty"`
+	ChatType          string         `json:"chat_type,omitempty"`
+	ChatID            string         `json:"chat_id,omitempty"`
+	ThreadID          string         `json:"thread_id,omitempty"`
+	RootID            string         `json:"root_id,omitempty"`
+	SenderID          string         `json:"sender_id,omitempty"`
+	SenderDisplayName string         `json:"sender_display_name,omitempty"`
+	MessageType       string         `json:"message_type,omitempty"`
+	Text              string         `json:"text,omitempty"`
+	CreatedAt         string         `json:"created_at,omitempty"`
+	Raw               map[string]any `json:"raw,omitempty"`
 }
 
 type MentionIdentity struct {
 	ID          string `json:"id"`
 	IDType      string `json:"id_type,omitempty"`
 	DisplayName string `json:"display_name,omitempty"`
+}
+
+type ChatIdentity struct {
+	ID          string `json:"id,omitempty"`
+	IDType      string `json:"id_type,omitempty"`
+	Type        string `json:"type,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
+	AvatarURL   string `json:"avatar_url,omitempty"`
 }
 
 type OutboundMessage struct {
@@ -200,6 +294,7 @@ type OutboundMessage struct {
 	MessageUUID   string `json:"message_uuid"`
 	ChatType      string `json:"chat_type"`
 	ChatID        string `json:"chat_id"`
+	ThreadID      string `json:"thread_id,omitempty"`
 	Text          string `json:"text"`
 	// Format is a common host-facing field. Set "markdown" for rich rendering;
 	// each SDK maps it to platform-native delivery or falls back internally.
@@ -217,6 +312,32 @@ type SendResult struct {
 	Platform    string         `json:"platform"`
 	AccountUUID string         `json:"account_uuid"`
 	MessageID   string         `json:"message_id,omitempty"`
+	Raw         map[string]any `json:"raw,omitempty"`
+}
+
+type OutboundAck struct {
+	WorkspaceUUID     string         `json:"workspace_uuid"`
+	Platform          string         `json:"platform"`
+	AccountUUID       string         `json:"account_uuid"`
+	ChannelUUID       string         `json:"channel_uuid"`
+	SessionUUID       string         `json:"session_uuid"`
+	SourceMessageUUID string         `json:"source_message_uuid,omitempty"`
+	ChatType          string         `json:"chat_type"`
+	ChatID            string         `json:"chat_id"`
+	TargetMessageID   string         `json:"target_message_id,omitempty"`
+	Intent            string         `json:"intent,omitempty"`
+	Action            string         `json:"action,omitempty"`
+	Mode              string         `json:"mode,omitempty"`
+	Emoji             string         `json:"emoji,omitempty"`
+	Raw               map[string]any `json:"raw,omitempty"`
+}
+
+type AckResult struct {
+	Platform    string         `json:"platform"`
+	AccountUUID string         `json:"account_uuid"`
+	Mode        string         `json:"mode,omitempty"`
+	Status      string         `json:"status"`
+	ReactionID  string         `json:"reaction_id,omitempty"`
 	Raw         map[string]any `json:"raw,omitempty"`
 }
 
@@ -241,6 +362,10 @@ type EnsureChatSessionRequest struct {
 	AccountUUID         string
 	ChatType            string
 	ChatID              string
+	ThreadID            string
+	ChatDisplayName     string
+	ChatAvatarURL       string
+	ChatIdentity        ChatIdentity
 	SenderID            string
 	AgentParticipantID  string
 	BridgeParticipantID string

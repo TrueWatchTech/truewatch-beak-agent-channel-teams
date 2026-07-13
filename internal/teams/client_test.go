@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/TrueWatchTech/truewatch-beak-agent-channel-teams/sdk"
 )
 
 type testRoundTripFunc func(*http.Request) (*http.Response, error)
@@ -84,7 +86,7 @@ func TestClientSendText(t *testing.T) {
 	client := NewClient("", map[string]string{"client_id": "c", "client_secret": "s"})
 	client.HTTPClient = httpClient
 
-	id, err := client.SendText(context.Background(), "https://smba.trafficmanager.net/amer/", "C1", "hi", "", nil, false)
+	id, err := client.SendText(context.Background(), "https://smba.trafficmanager.net/amer/", "C1", "", "hi", "", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,5 +113,24 @@ func TestValidateServiceURL_RejectsNonAllowlisted(t *testing.T) {
 	}
 	if err := validateServiceURL("https://amer.botframework.com/x"); err != nil {
 		t.Fatalf("botframework.com subdomain rejected: %v", err)
+	}
+}
+
+func TestBuildMentionEntities_DoesNotDuplicateExistingMarkup(t *testing.T) {
+	prefix, entities := buildMentionEntities("<at>Alice</at> hello", []sdk.MentionIdentity{{ID: "29:alice", DisplayName: "Alice"}})
+	if prefix != "" {
+		t.Fatalf("existing mention markup must not be prepended again: %q", prefix)
+	}
+	if len(entities) != 1 {
+		t.Fatalf("mention entity must still be emitted: %#v", entities)
+	}
+}
+
+func TestMentionAllRequiresExplicitAllIdentity(t *testing.T) {
+	if hasMentionAllIdentity([]sdk.MentionIdentity{{ID: "29:alice", DisplayName: "Alice"}}) {
+		t.Fatal("an ordinary user mention must not satisfy mention_all")
+	}
+	if !hasMentionAllIdentity([]sdk.MentionIdentity{{ID: "19:channel", IDType: "teams_mention_all", DisplayName: "Everyone"}}) {
+		t.Fatal("an explicit Teams all identity should satisfy mention_all")
 	}
 }

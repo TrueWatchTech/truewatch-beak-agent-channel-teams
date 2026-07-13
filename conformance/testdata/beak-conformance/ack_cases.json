@@ -1,0 +1,20 @@
+[
+  {
+    "name": "reaction_is_explicitly_unsupported",
+    "request": {
+      "workspace_uuid": "ws-1",
+      "channel_uuid": "channel-1",
+      "account_uuid": "acct-1",
+      "platform": "teams",
+      "chat_type": "group",
+      "chat_id": "C1",
+      "target_message_id": "activity-1",
+      "mode": "reaction",
+      "emoji": "eyes"
+    },
+    "expect": {
+      "status": "unsupported",
+      "mode": "reaction"
+    }
+  }
+]

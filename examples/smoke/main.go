@@ -46,8 +46,8 @@ import (
 	"strings"
 	"sync"
 
-	beak "github.com/TrueWatch/beak-agent-channel-teams"
-	"github.com/TrueWatch/beak-agent-channel-teams/sdk"
+	beak "github.com/TrueWatchTech/truewatch-beak-agent-channel-teams"
+	"github.com/TrueWatchTech/truewatch-beak-agent-channel-teams/sdk"
 )
 
 // credentialFieldSpec mirrors one entry of platforms/teams.yaml's

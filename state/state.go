@@ -13,17 +13,30 @@ const (
 )
 
 type AccountState struct {
-	AccountID              string                     `json:"account_id"`
-	ChannelLinkSession     string                     `json:"channel_link_session,omitempty"`
-	PeerSessions           map[string]string          `json:"peer_sessions,omitempty"`
-	InboundSeen            map[string]string          `json:"inbound_seen,omitempty"`
-	SentBeakMessages       map[string]string          `json:"sent_beak_messages,omitempty"`
-	StreamCursors          map[string]string          `json:"stream_cursors,omitempty"`
-	TenantID               string                     `json:"tenant_id,omitempty"`
-	BotID                  string                     `json:"bot_id,omitempty"`
-	ConversationReferences map[string]json.RawMessage `json:"conversation_references,omitempty"`
-	ServiceUrls            map[string]string          `json:"service_urls,omitempty"`
-	UpdatedAt              time.Time                  `json:"updated_at"`
+	AccountID                  string                     `json:"account_id"`
+	ChannelLinkSession         string                     `json:"channel_link_session,omitempty"`
+	PeerSessions               map[string]string          `json:"peer_sessions,omitempty"`
+	InboundSeen                map[string]string          `json:"inbound_seen,omitempty"`
+	SentBeakMessages           map[string]string          `json:"sent_beak_messages,omitempty"`
+	StreamCursors              map[string]string          `json:"stream_cursors,omitempty"`
+	TenantID                   string                     `json:"tenant_id,omitempty"`
+	BotID                      string                     `json:"bot_id,omitempty"`
+	ConversationReferences     map[string]json.RawMessage `json:"conversation_references,omitempty"`
+	ServiceUrls                map[string]string          `json:"service_urls,omitempty"`
+	StreamConnectionState      string                     `json:"stream_connection_state,omitempty"`
+	StreamConnectedAt          time.Time                  `json:"stream_connected_at,omitempty"`
+	StreamDisconnectedAt       time.Time                  `json:"stream_disconnected_at,omitempty"`
+	StreamLastActivityAt       time.Time                  `json:"stream_last_activity_at,omitempty"`
+	StreamLastPingAt           time.Time                  `json:"stream_last_ping_at,omitempty"`
+	StreamLastPongAt           time.Time                  `json:"stream_last_pong_at,omitempty"`
+	StreamLastEventAt          time.Time                  `json:"stream_last_event_at,omitempty"`
+	StreamLastError            string                     `json:"stream_last_error,omitempty"`
+	StreamLastErrorAt          time.Time                  `json:"stream_last_error_at,omitempty"`
+	StreamReconnectRequestedAt time.Time                  `json:"stream_reconnect_requested_at,omitempty"`
+	StreamReconnectError       string                     `json:"stream_reconnect_error,omitempty"`
+	StreamReconnectErrorAt     time.Time                  `json:"stream_reconnect_error_at,omitempty"`
+	StreamSessionExpired       bool                       `json:"stream_session_expired,omitempty"`
+	UpdatedAt                  time.Time                  `json:"updated_at"`
 }
 
 func (a *AccountState) EnsureMaps() {

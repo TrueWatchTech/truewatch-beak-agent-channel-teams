@@ -14,7 +14,9 @@ func TestConformance(t *testing.T) {
 		CredentialSchemaProvider: a,
 		CredentialValidator:      a,
 		InboundParser:            a,
+		Acknowledger:             a,
 		CredentialCases:          conformance.MustLoadJSON[[]conformance.CredentialValidationCase](t, "testdata/beak-conformance/credential_cases.json"),
 		InboundCases:             conformance.MustLoadJSON[[]conformance.InboundCase](t, "testdata/beak-conformance/inbound_cases.json"),
+		AckCases:                 conformance.MustLoadJSON[[]conformance.AckCase](t, "testdata/beak-conformance/ack_cases.json"),
 	})
 }

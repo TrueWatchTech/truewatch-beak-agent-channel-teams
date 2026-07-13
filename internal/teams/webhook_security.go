@@ -44,10 +44,17 @@ type jwksProvider struct {
 	openIDConfigURL string
 
 	mu        sync.Mutex
-	keys      map[string]*rsa.PublicKey
+	keys      map[string]signingKey
 	fetchedAt time.Time
 	cacheTTL  time.Duration
 }
+
+type signingKey struct {
+	publicKey    *rsa.PublicKey
+	endorsements []string
+}
+
+var sharedJWKSProviders sync.Map
 
 // NewJWKSProvider builds a provider backed by the given HTTP client. A nil
 // client falls back to http.DefaultClient.
@@ -58,17 +65,31 @@ func NewJWKSProvider(httpClient *http.Client) *jwksProvider {
 	return &jwksProvider{
 		httpClient:      httpClient,
 		openIDConfigURL: DefaultOpenIDConfigURL,
-		keys:            make(map[string]*rsa.PublicKey),
+		keys:            make(map[string]signingKey),
 		cacheTTL:        jwksCacheTTL,
 	}
+}
+
+// SharedJWKSProvider returns one cache per HTTP client so Microsoft signing
+// keys are reused across webhook deliveries for the documented 24-hour TTL.
+func SharedJWKSProvider(httpClient *http.Client) *jwksProvider {
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	if provider, ok := sharedJWKSProviders.Load(httpClient); ok {
+		return provider.(*jwksProvider)
+	}
+	provider := NewJWKSProvider(httpClient)
+	actual, _ := sharedJWKSProviders.LoadOrStore(httpClient, provider)
+	return actual.(*jwksProvider)
 }
 
 // keyFor returns the RSA public key whose kid matches. It serves from cache
 // when the cache is fresh and contains the kid; otherwise it refreshes the key
 // set from the OpenID config -> jwks_uri chain and retries once.
-func (p *jwksProvider) keyFor(ctx context.Context, kid string) (*rsa.PublicKey, error) {
+func (p *jwksProvider) keyFor(ctx context.Context, kid string) (signingKey, error) {
 	if strings.TrimSpace(kid) == "" {
-		return nil, fmt.Errorf("teams jwt: token has no kid")
+		return signingKey{}, fmt.Errorf("teams jwt: token has no kid")
 	}
 
 	p.mu.Lock()
@@ -84,7 +105,7 @@ func (p *jwksProvider) keyFor(ctx context.Context, kid string) (*rsa.PublicKey, 
 	// Cache miss or stale: refresh.
 	keys, err := p.fetchKeys(ctx)
 	if err != nil {
-		return nil, err
+		return signingKey{}, err
 	}
 	p.mu.Lock()
 	p.keys = keys
@@ -92,14 +113,14 @@ func (p *jwksProvider) keyFor(ctx context.Context, kid string) (*rsa.PublicKey, 
 	key, ok := p.keys[kid]
 	p.mu.Unlock()
 	if !ok {
-		return nil, fmt.Errorf("teams jwt: no signing key for kid %q", kid)
+		return signingKey{}, fmt.Errorf("teams jwt: no signing key for kid %q", kid)
 	}
 	return key, nil
 }
 
 // fetchKeys performs the OpenID config -> jwks_uri -> JWKS fetch and parses each
 // RSA key into an *rsa.PublicKey keyed by kid.
-func (p *jwksProvider) fetchKeys(ctx context.Context) (map[string]*rsa.PublicKey, error) {
+func (p *jwksProvider) fetchKeys(ctx context.Context) (map[string]signingKey, error) {
 	var cfg openIDConfig
 	if err := p.getJSON(ctx, p.openIDConfigURL, &cfg); err != nil {
 		return nil, fmt.Errorf("teams jwks: fetch openid config: %w", err)
@@ -113,9 +134,12 @@ func (p *jwksProvider) fetchKeys(ctx context.Context) (map[string]*rsa.PublicKey
 		return nil, fmt.Errorf("teams jwks: fetch keys: %w", err)
 	}
 
-	out := make(map[string]*rsa.PublicKey, len(set.Keys))
+	out := make(map[string]signingKey, len(set.Keys))
 	for _, k := range set.Keys {
-		if k.Kty != "" && k.Kty != "RSA" {
+		if k.Kty != "" && !strings.EqualFold(k.Kty, "RSA") {
+			continue
+		}
+		if k.Use != "" && !strings.EqualFold(k.Use, "sig") {
 			continue
 		}
 		if k.N == "" || k.E == "" || k.Kid == "" {
@@ -125,7 +149,7 @@ func (p *jwksProvider) fetchKeys(ctx context.Context) (map[string]*rsa.PublicKey
 		if err != nil {
 			continue
 		}
-		out[k.Kid] = key
+		out[k.Kid] = signingKey{publicKey: key, endorsements: append([]string(nil), k.Endorsements...)}
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("teams jwks: no usable RSA signing keys")
@@ -196,10 +220,10 @@ type jwtClaims struct {
 
 // VerifyWebhookToken validates the Authorization Bearer JWT on an inbound Bot
 // Framework activity. It enforces alg=RS256, iss/aud, the validity window (with
-// ±5m clock skew), the serviceurl claim (when present) against the activity's
+// ±5m clock skew), the required serviceurl claim against the activity's
 // serviceUrl, and the RS256 signature against the JWKS key matching the token
 // kid. Any failure is returned as a Go error so the caller can reject with 403.
-func VerifyWebhookToken(ctx context.Context, provider *jwksProvider, authorizationHeader, expectedAudience, serviceURL string, now time.Time) error {
+func VerifyWebhookToken(ctx context.Context, provider *jwksProvider, authorizationHeader, expectedAudience, serviceURL, channelID string, now time.Time) error {
 	if provider == nil {
 		return fmt.Errorf("teams jwt: provider is required")
 	}
@@ -207,8 +231,12 @@ func VerifyWebhookToken(ctx context.Context, provider *jwksProvider, authorizati
 	if raw == "" {
 		return fmt.Errorf("teams jwt: missing Authorization header")
 	}
-	if strings.HasPrefix(strings.ToLower(raw), "bearer ") {
-		raw = strings.TrimSpace(raw[len("bearer "):])
+	if !strings.HasPrefix(strings.ToLower(raw), "bearer ") {
+		return fmt.Errorf("teams jwt: Authorization scheme must be Bearer")
+	}
+	raw = strings.TrimSpace(raw[len("bearer "):])
+	if raw == "" {
+		return fmt.Errorf("teams jwt: bearer token is empty")
 	}
 
 	parts := strings.Split(raw, ".")
@@ -247,13 +275,22 @@ func VerifyWebhookToken(ctx context.Context, provider *jwksProvider, authorizati
 	if claims.Aud != expectedAudience {
 		return fmt.Errorf("teams jwt: audience mismatch")
 	}
-	if claims.Exp != 0 && now.After(time.Unix(claims.Exp, 0).Add(clockSkew)) {
+	if claims.Exp == 0 {
+		return fmt.Errorf("teams jwt: exp claim is required")
+	}
+	if now.After(time.Unix(claims.Exp, 0).Add(clockSkew)) {
 		return fmt.Errorf("teams jwt: token expired")
 	}
 	if claims.Nbf != 0 && now.Before(time.Unix(claims.Nbf, 0).Add(-clockSkew)) {
 		return fmt.Errorf("teams jwt: token not yet valid")
 	}
-	if claims.ServiceURL != "" && serviceURL != "" && claims.ServiceURL != serviceURL {
+	if strings.TrimSpace(claims.ServiceURL) == "" {
+		return fmt.Errorf("teams jwt: serviceurl claim is required")
+	}
+	if strings.TrimSpace(serviceURL) == "" {
+		return fmt.Errorf("teams jwt: activity serviceUrl is required")
+	}
+	if claims.ServiceURL != serviceURL {
 		return fmt.Errorf("teams jwt: serviceurl claim mismatch")
 	}
 
@@ -266,11 +303,23 @@ func VerifyWebhookToken(ctx context.Context, provider *jwksProvider, authorizati
 	if err != nil {
 		return err
 	}
+	if channelID = strings.TrimSpace(channelID); channelID != "" && !containsFold(key.endorsements, channelID) {
+		return fmt.Errorf("teams jwt: signing key is not endorsed for channel %q", channelID)
+	}
 
 	signingInput := headerSeg + "." + claimSeg
 	digest := sha256.Sum256([]byte(signingInput))
-	if err := rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], sig); err != nil {
+	if err := rsa.VerifyPKCS1v15(key.publicKey, crypto.SHA256, digest[:], sig); err != nil {
 		return fmt.Errorf("teams jwt: signature verification failed: %w", err)
 	}
 	return nil
+}
+
+func containsFold(values []string, target string) bool {
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(value), target) {
+			return true
+		}
+	}
+	return false
 }

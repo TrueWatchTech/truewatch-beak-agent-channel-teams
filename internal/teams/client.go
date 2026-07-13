@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -12,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/TrueWatch/beak-agent-channel-teams/sdk"
+	"github.com/TrueWatchTech/truewatch-beak-agent-channel-teams/sdk"
 )
 
 // DefaultBaseURL is the Microsoft Teams API base. Override via NewClient for private
@@ -87,6 +88,7 @@ func (c *Client) Validate(ctx context.Context) (*BotInfo, error) {
 	return &BotInfo{
 		AccountID:   clientID,
 		BotID:       clientID,
+		BotUserID:   "28:" + clientID,
 		DisplayName: clientID,
 		BotName:     clientID,
 	}, nil
@@ -155,15 +157,22 @@ func (c *Client) acquireToken(ctx context.Context) (string, error) {
 // activity id. serviceURL must come from a previously stored conversation
 // reference; it is validated against the Microsoft service-url allowlist to
 // prevent SSRF. markdown is delivered with textFormat=markdown.
-func (c *Client) SendText(ctx context.Context, serviceURL, chatID, text, format string, mentions []sdk.MentionIdentity, mentionAll bool) (string, error) {
+func (c *Client) SendText(ctx context.Context, serviceURL, chatID, replyToID, text, format string, mentions []sdk.MentionIdentity, mentionAll bool) (string, error) {
 	if strings.TrimSpace(serviceURL) == "" {
 		return "", fmt.Errorf("teams serviceUrl is required")
 	}
 	if strings.TrimSpace(chatID) == "" {
 		return "", fmt.Errorf("teams chat_id is required")
 	}
+	if strings.TrimSpace(text) == "" {
+		return "", fmt.Errorf("teams text is required")
+	}
 	if err := validateServiceURL(serviceURL); err != nil {
 		return "", err
+	}
+	mentionText, entities := buildMentionEntities(text, mentions)
+	if mentionAll && !hasMentionAllIdentity(mentions) {
+		return "", fmt.Errorf("teams mention_all requires an explicit Teams mention identity")
 	}
 	token, err := c.acquireToken(ctx)
 	if err != nil {
@@ -174,23 +183,77 @@ func (c *Client) SendText(ctx context.Context, serviceURL, chatID, text, format 
 	if strings.EqualFold(format, "markdown") {
 		textFormat = "markdown"
 	}
-	_ = mentions
-	_ = mentionAll
+	if mentionText != "" {
+		text = mentionText + " " + text
+	}
 
 	payload := map[string]any{
 		"type":       "message",
 		"text":       text,
 		"textFormat": textFormat,
 	}
+	if len(entities) > 0 {
+		payload["entities"] = entities
+	}
+	if replyToID = strings.TrimSpace(replyToID); replyToID != "" {
+		payload["replyToId"] = replyToID
+	}
 
 	base := strings.TrimRight(serviceURL, "/")
 	endpoint := base + "/v3/conversations/" + url.PathEscape(chatID) + "/activities"
+	if replyToID != "" {
+		endpoint += "/" + url.PathEscape(replyToID)
+	}
 
 	var resp sendActivityResponse
 	if err := c.doJSONAbsolute(ctx, http.MethodPost, endpoint, payload, &resp, withBearer(token)); err != nil {
 		return "", err
 	}
 	return resp.ID, nil
+}
+
+func buildMentionEntities(text string, mentions []sdk.MentionIdentity) (string, []map[string]any) {
+	seen := make(map[string]struct{})
+	texts := make([]string, 0, len(mentions))
+	entities := make([]map[string]any, 0, len(mentions))
+	for _, mention := range mentions {
+		id := strings.TrimSpace(mention.ID)
+		name := strings.TrimSpace(mention.DisplayName)
+		if id == "" || name == "" {
+			continue
+		}
+		key := strings.ToLower(id)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		visible := "<at>" + html.EscapeString(name) + "</at>"
+		if !strings.Contains(text, visible) {
+			texts = append(texts, visible)
+		}
+		entities = append(entities, map[string]any{
+			"type": "mention",
+			"mentioned": map[string]any{
+				"id":   id,
+				"name": name,
+			},
+			"text": visible,
+		})
+	}
+	return strings.Join(texts, " "), entities
+}
+
+func hasMentionAllIdentity(mentions []sdk.MentionIdentity) bool {
+	for _, mention := range mentions {
+		if strings.EqualFold(strings.TrimSpace(mention.IDType), "mention_all") ||
+			strings.EqualFold(strings.TrimSpace(mention.IDType), "teams_mention_all") ||
+			strings.EqualFold(strings.TrimSpace(mention.ID), "everyone") ||
+			strings.EqualFold(strings.TrimSpace(mention.ID), "all") ||
+			strings.EqualFold(strings.TrimSpace(mention.DisplayName), "everyone") {
+			return true
+		}
+	}
+	return false
 }
 
 // validateServiceURL enforces an allowlist of known Microsoft connector-service
@@ -206,6 +269,9 @@ func validateServiceURL(serviceURL string) error {
 	}
 	host := strings.ToLower(parsed.Hostname())
 	if host == "smba.trafficmanager.net" ||
+		host == "smba.infra.gcc.teams.microsoft.com" ||
+		host == "smba.infra.gov.teams.microsoft.us" ||
+		host == "smba.infra.dod.teams.microsoft.us" ||
 		strings.HasSuffix(host, ".botframework.com") ||
 		host == "botframework.com" {
 		return nil

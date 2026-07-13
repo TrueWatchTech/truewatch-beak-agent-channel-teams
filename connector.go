@@ -11,14 +11,15 @@ import (
 	"sync"
 	"time"
 
-	platform "github.com/TrueWatch/beak-agent-channel-teams/internal/teams"
-	"github.com/TrueWatch/beak-agent-channel-teams/sdk"
-	"github.com/TrueWatch/beak-agent-channel-teams/state"
+	platform "github.com/TrueWatchTech/truewatch-beak-agent-channel-teams/internal/teams"
+	"github.com/TrueWatchTech/truewatch-beak-agent-channel-teams/sdk"
+	"github.com/TrueWatchTech/truewatch-beak-agent-channel-teams/state"
 )
 
 const (
-	ID       = "beak-agent-teams"
-	Platform = "teams"
+	ID                  = "beak-agent-teams"
+	Platform            = "teams"
+	maxWebhookBodyBytes = 4 << 20
 )
 
 var ErrCredentialLogin = errors.New("teams connector uses credential login; create channel account from CredentialSchema")
@@ -48,14 +49,16 @@ func (Connector) Metadata() sdk.ConnectorMetadata {
 		Label:       "Microsoft Teams",
 		Description: "Connect Microsoft Teams bot accounts to Beak Channel Gateway",
 		Capabilities: sdk.Capabilities{
-			LoginModes:     []string{sdk.LoginModeCredential},
-			Text:           true,
-			Media:          false,
-			GroupChat:      true,
-			DirectChat:     true,
-			Stream:         false,
-			Webhook:        true,
-			BlockStreaming: false,
+			LoginModes:       []string{sdk.LoginModeCredential},
+			Text:             true,
+			Media:            false,
+			GroupChat:        true,
+			DirectChat:       true,
+			Stream:           false,
+			Webhook:          true,
+			BlockStreaming:   false,
+			AckModes:         nil,
+			RuntimeOwnership: "",
 		},
 	}
 }
@@ -130,8 +133,10 @@ func (Connector) ValidateCredential(ctx context.Context, req sdk.CredentialValid
 	// Standardized nested identity (in addition to the flat keys above, which
 	// self-echo detection still reads) so generic conformance/host tooling can
 	// find the bot's identity at a single well-known path.
-	if id := firstString(info.BotUserID, info.BotID, info.AccountID); id != "" {
-		stateMap["bot_identity"] = map[string]any{"id": id}
+	identities := teamsBotIdentityState(info.AccountID, info.BotUserID)
+	if len(identities) > 0 {
+		stateMap["bot_identity"] = identities[0]
+		stateMap["bot_identities"] = identities
 	}
 	return &sdk.CredentialValidationResult{
 		Valid:       true,
@@ -233,7 +238,8 @@ func (Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbound
 
 	client := platform.NewClient("", credentialStrings(account.Credential))
 	client.HTTPClient = runtime.HTTPClient
-	messageID, err := client.SendText(ctx, serviceURL, req.ChatID, req.Text, req.Format, req.Mentions, req.MentionAll)
+	replyToID := firstString(req.ThreadID, req.Raw["reply_to_id"], req.Raw["replyToId"], req.Raw["thread_id"])
+	messageID, err := client.SendText(ctx, serviceURL, req.ChatID, replyToID, req.Text, req.Format, req.Mentions, req.MentionAll)
 	if err != nil {
 		return nil, err
 	}
@@ -244,6 +250,19 @@ func (Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbound
 		Platform:    Platform,
 		AccountUUID: accountUUID,
 		MessageID:   messageID,
+	}, nil
+}
+
+// Acknowledge is part of the common Beak connector contract. Bot Framework
+// does not expose a portable reaction/read/typing API for this connector, so
+// unsupported is returned explicitly instead of forcing host-side branching.
+func (Connector) Acknowledge(_ context.Context, _ sdk.Runtime, req sdk.OutboundAck) (*sdk.AckResult, error) {
+	return &sdk.AckResult{
+		Platform:    Platform,
+		AccountUUID: strings.TrimSpace(req.AccountUUID),
+		Mode:        strings.TrimSpace(req.Mode),
+		Status:      "unsupported",
+		Raw:         map[string]any{"reason": "unsupported_ack_mode"},
 	}, nil
 }
 
@@ -259,9 +278,15 @@ func (Connector) Stop(ctx context.Context, account sdk.ChannelAccount) error {
 // serviceUrl claim) before processing. Verification failures are returned as a
 // Go error so the gateway can reject with 403.
 func (c Connector) HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, req *http.Request) (*sdk.WebhookResponse, error) {
-	body, err := io.ReadAll(req.Body)
+	if req == nil || req.Body == nil {
+		return nil, fmt.Errorf("%s webhook request body is required", Platform)
+	}
+	body, err := io.ReadAll(io.LimitReader(req.Body, maxWebhookBodyBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("%s read webhook body: %w", Platform, err)
+	}
+	if len(body) > maxWebhookBodyBytes {
+		return nil, fmt.Errorf("%s webhook body exceeds %d bytes", Platform, maxWebhookBodyBytes)
 	}
 
 	var activity platform.Activity
@@ -270,8 +295,8 @@ func (c Connector) HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime
 	}
 
 	expectedAudience := firstString(account.Credential["client_id"], account.Credential["bot_id"], account.Credential["account_id"])
-	provider := platform.NewJWKSProvider(runtime.HTTPClient)
-	if err := platform.VerifyWebhookToken(ctx, provider, req.Header.Get("Authorization"), expectedAudience, activity.ServiceURL, time.Now().UTC()); err != nil {
+	provider := platform.SharedJWKSProvider(runtime.HTTPClient)
+	if err := platform.VerifyWebhookToken(ctx, provider, req.Header.Get("Authorization"), expectedAudience, activity.ServiceURL, activity.ChannelID, time.Now().UTC()); err != nil {
 		return nil, err
 	}
 
@@ -299,6 +324,12 @@ func (c Connector) HandleWebhook(ctx context.Context, runtime sdk.Runtime, accou
 // the only way the bot can later send proactively. Beak messages are created
 // only for genuine inbound text.
 func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, activity *platform.Activity) (*EventResult, error) {
+	if runtime.Gateway == nil {
+		return nil, fmt.Errorf("%s event handling requires sdk.Runtime.Gateway", Platform)
+	}
+	if activity == nil {
+		return nil, fmt.Errorf("%s activity is required", Platform)
+	}
 	accountUUID := accountKey(account)
 	if accountUUID == "" {
 		return nil, fmt.Errorf("%s account_uuid or account_id is required", Platform)
@@ -311,19 +342,26 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 		return nil, err
 	}
 
-	botID := firstString(st.BotID, account.Credential["bot_id"], account.Credential["client_id"], account.State["bot_id"])
+	botIDs := teamsBotIDs(activity, st, account)
 
 	// Normalize chat identity up-front so the conversation reference can be
 	// keyed consistently.
 	chatType := sdk.ChatTypeGroup
-	switch activity.Conversation.ConversationType {
+	switch strings.ToLower(strings.TrimSpace(activity.Conversation.ConversationType)) {
 	case "personal":
 		chatType = sdk.ChatTypeDirect
-	case "channel", "groupChat":
+	case "channel", "groupchat":
 		chatType = sdk.ChatTypeGroup
 	}
 	chatID := strings.TrimSpace(activity.Conversation.ID)
 	stateKey := Platform + ":" + chatType + ":" + chatID
+	now := time.Now().UTC()
+	if st.StreamConnectedAt.IsZero() {
+		st.StreamConnectedAt = now
+	}
+	st.StreamConnectionState = sdk.RuntimeHealthStateConnected
+	st.StreamLastActivityAt = now
+	st.StreamSessionExpired = false
 
 	// Persist the conversation reference on every activity, before any filter,
 	// so outbound sends work even when the triggering activity is ignored.
@@ -340,9 +378,9 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 			st.ConversationReferences[stateKey] = data
 		}
 		st.ServiceUrls[chatID] = activity.ServiceURL
-		if err := store.SaveAccount(ctx, st); err != nil {
-			return nil, err
-		}
+	}
+	if err := store.SaveAccount(ctx, st); err != nil {
+		return nil, err
 	}
 
 	// conversationUpdate (bot added/removed, members changed) carries no text;
@@ -355,38 +393,51 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 	}
 
 	senderID := firstString(activity.From.AADObjectID, activity.From.ID)
-	text := strings.TrimSpace(activity.Text)
+	text := activityText(activity)
 	messageID := strings.TrimSpace(activity.ID)
 
 	// Self-echo: drop the bot's own messages (from == bot id, or from == the
 	// recipient, which for an echo is the bot itself).
-	if botID != "" && (activity.From.ID == botID || activity.From.AADObjectID == botID) {
+	if matchesTeamsBot(activity.From.ID, botIDs) || matchesTeamsBot(activity.From.AADObjectID, botIDs) {
 		return &EventResult{Type: activity.Type, Ignored: true, Reason: "self_echo"}, nil
 	}
-	if activity.Recipient.ID != "" && activity.From.ID == activity.Recipient.ID {
+	if activity.Recipient.ID != "" && strings.EqualFold(activity.From.ID, activity.Recipient.ID) {
 		return &EventResult{Type: activity.Type, Ignored: true, Reason: "self_echo"}, nil
 	}
 
 	// Mention detection: scan entities for a mention of the bot.
 	mentionedMe := false
+	mentionAll := false
+	mentions := make([]sdk.MentionIdentity, 0, len(activity.Entities))
 	for _, raw := range activity.Entities {
-		var ent struct {
-			Type      string `json:"type"`
-			Mentioned struct {
-				ID string `json:"id"`
-			} `json:"mentioned"`
-		}
+		var ent platform.MentionEntity
 		if err := json.Unmarshal(raw, &ent); err != nil {
 			continue
 		}
-		if strings.EqualFold(ent.Type, "mention") && botID != "" && ent.Mentioned.ID == botID {
+		if !strings.EqualFold(ent.Type, "mention") {
+			continue
+		}
+		id := firstString(ent.Mentioned.AADObjectID, ent.Mentioned.ID)
+		name := strings.TrimSpace(ent.Mentioned.Name)
+		if id != "" {
+			idType := "teams_user_id"
+			if strings.TrimSpace(ent.Mentioned.AADObjectID) != "" {
+				idType = "aad_object_id"
+			}
+			mentions = append(mentions, sdk.MentionIdentity{ID: id, IDType: idType, DisplayName: name})
+		}
+		if matchesTeamsBot(ent.Mentioned.ID, botIDs) || matchesTeamsBot(ent.Mentioned.AADObjectID, botIDs) {
 			mentionedMe = true
-			break
+			text = stripTeamsMention(text, ent)
+		}
+		if strings.EqualFold(id, "everyone") || strings.EqualFold(id, "all") || strings.EqualFold(name, "everyone") {
+			mentionAll = true
 		}
 	}
+	text = strings.TrimSpace(text)
 
 	// Text-only filter (skip non-text / incomplete activities).
-	if chatID == "" || senderID == "" || text == "" {
+	if chatID == "" || senderID == "" || messageID == "" || (text == "" && !mentionedMe) {
 		return &EventResult{Type: activity.Type, Ignored: true, Reason: "unsupported_message_type"}, nil
 	}
 
@@ -397,22 +448,31 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 	}
 
 	inbound := sdk.InboundMessage{
-		WorkspaceUUID: runtime.WorkspaceUUID,
-		Platform:      Platform,
-		AccountUUID:   accountUUID,
-		ChannelUUID:   runtime.Channel.UUID,
-		ChatType:      chatType,
-		ChatID:        chatID,
-		SenderID:      senderID,
-		MessageID:     messageID,
-		Text:          text,
-		DedupeKey:     dedupeKey,
-		MentionedMe:   mentionedMe,
+		WorkspaceUUID:     runtime.WorkspaceUUID,
+		Platform:          Platform,
+		AccountUUID:       accountUUID,
+		ChannelUUID:       runtime.Channel.UUID,
+		ChatType:          chatType,
+		ChatID:            chatID,
+		ThreadID:          strings.TrimSpace(activity.ReplyToID),
+		ChatDisplayName:   teamsChatDisplayName(activity, chatType),
+		ChatIdentity:      teamsChatIdentity(activity, chatType, chatID),
+		SenderID:          senderID,
+		SenderDisplayName: strings.TrimSpace(activity.From.Name),
+		MessageID:         messageID,
+		Text:              text,
+		ReferencedMessage: teamsReferencedMessage(activity, chatType, chatID),
+		DedupeKey:         dedupeKey,
+		Mentions:          mentions,
+		MentionedMe:       mentionedMe,
+		MentionAll:        mentionAll,
 		Raw: map[string]any{
 			"activity_id": messageID,
 			"chat_id":     chatID,
 			"service_url": activity.ServiceURL,
 			"from":        senderID,
+			"channel_id":  activity.ChannelID,
+			"reply_to_id": activity.ReplyToID,
 		},
 	}
 
@@ -424,9 +484,19 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 		AccountUUID:         accountUUID,
 		ChatType:            chatType,
 		ChatID:              chatID,
+		ThreadID:            inbound.ThreadID,
+		ChatDisplayName:     inbound.ChatDisplayName,
+		ChatIdentity:        inbound.ChatIdentity,
 		SenderID:            senderID,
 		AgentParticipantID:  runtime.Gateway.AgentParticipantID(),
 		BridgeParticipantID: runtime.Gateway.BridgeParticipantID(Platform),
+		Metadata: map[string]any{
+			"source":            Platform,
+			"platform":          Platform,
+			"account_uuid":      accountUUID,
+			"chat_display_name": inbound.ChatDisplayName,
+			"chat_identity":     inbound.ChatIdentity,
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -439,10 +509,19 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 		Content:       text,
 		DedupeKey:     dedupeKey,
 		Metadata: map[string]any{
-			"source":          Platform,
-			"teams_chat_type": chatType,
-			"teams_chat_id":   chatID,
-			"inbound_message": inbound,
+			"source":              Platform,
+			"platform":            Platform,
+			"account_uuid":        accountUUID,
+			"chat_type":           chatType,
+			"chat_id":             chatID,
+			"thread_id":           inbound.ThreadID,
+			"chat_identity":       inbound.ChatIdentity,
+			"chat_display_name":   inbound.ChatDisplayName,
+			"sender_display_name": inbound.SenderDisplayName,
+			"referenced_message":  inbound.ReferencedMessage,
+			"teams_chat_type":     chatType,
+			"teams_chat_id":       chatID,
+			"inbound_message":     inbound,
 		},
 	})
 	if err != nil {
@@ -450,7 +529,9 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 	}
 
 	st.PeerSessions[stateKey] = sessionUUID
-	st.InboundSeen[dedupeKey] = time.Now().UTC().Format(time.RFC3339Nano)
+	st.InboundSeen[dedupeKey] = now.Format(time.RFC3339Nano)
+	st.StreamLastEventAt = now
+	st.StreamLastActivityAt = now
 	if err := store.SaveAccount(ctx, st); err != nil {
 		return nil, err
 	}
@@ -461,6 +542,197 @@ func (c Connector) processMessageEvent(ctx context.Context, runtime sdk.Runtime,
 		MessageUUID: messageUUID,
 		Inbound:     &inbound,
 	}, nil
+}
+
+func teamsBotIdentityState(appID, channelBotID string) []map[string]any {
+	appID = strings.TrimSpace(appID)
+	channelBotID = strings.TrimSpace(channelBotID)
+	if channelBotID == "" && appID != "" {
+		channelBotID = "28:" + appID
+	}
+	identities := make([]map[string]any, 0, 2)
+	if appID != "" {
+		identities = append(identities, map[string]any{"id": appID, "id_type": "app_id"})
+	}
+	if channelBotID != "" && !strings.EqualFold(channelBotID, appID) {
+		identities = append(identities, map[string]any{"id": channelBotID, "id_type": "channel_account_id"})
+	}
+	return identities
+}
+
+func teamsBotIDs(activity *platform.Activity, st *state.AccountState, account sdk.ChannelAccount) map[string]struct{} {
+	ids := make(map[string]struct{})
+	add := func(value any) {
+		id := strings.TrimSpace(stringValue(value))
+		if id == "" {
+			return
+		}
+		ids[strings.ToLower(id)] = struct{}{}
+		if !strings.Contains(id, ":") {
+			ids[strings.ToLower("28:"+id)] = struct{}{}
+		}
+	}
+	if activity != nil {
+		add(activity.Recipient.ID)
+		add(activity.Recipient.AADObjectID)
+	}
+	if st != nil {
+		add(st.BotID)
+	}
+	add(account.Credential["client_id"])
+	add(account.Credential["bot_id"])
+	add(account.Credential["bot_user_id"])
+	add(account.State["bot_id"])
+	add(account.State["bot_user_id"])
+	if identity, ok := account.State["bot_identity"].(map[string]any); ok {
+		add(identity["id"])
+	}
+	switch identities := account.State["bot_identities"].(type) {
+	case []any:
+		for _, item := range identities {
+			if identity, ok := item.(map[string]any); ok {
+				add(identity["id"])
+			}
+		}
+	case []map[string]any:
+		for _, identity := range identities {
+			add(identity["id"])
+		}
+	}
+	return ids
+}
+
+func matchesTeamsBot(id string, botIDs map[string]struct{}) bool {
+	id = strings.ToLower(strings.TrimSpace(id))
+	if id == "" {
+		return false
+	}
+	_, ok := botIDs[id]
+	return ok
+}
+
+func stripTeamsMention(text string, mention platform.MentionEntity) string {
+	candidates := []string{strings.TrimSpace(mention.Text)}
+	if name := strings.TrimSpace(mention.Mentioned.Name); name != "" {
+		candidates = append(candidates, "<at>"+name+"</at>")
+	}
+	for _, candidate := range candidates {
+		if candidate != "" {
+			text = strings.ReplaceAll(text, candidate, "")
+		}
+	}
+	return strings.TrimSpace(text)
+}
+
+func activityText(activity *platform.Activity) string {
+	if activity == nil {
+		return ""
+	}
+	if text := strings.TrimSpace(activity.Text); text != "" {
+		return text
+	}
+	fragments := make([]string, 0)
+	appendJSONText(activity.Value, 0, &fragments)
+	for _, attachment := range activity.Attachments {
+		before := len(fragments)
+		appendJSONText(attachment.Content, 0, &fragments)
+		if len(fragments) == before {
+			fragments = append(fragments, strings.TrimSpace(attachment.Name))
+		}
+	}
+	return joinUniqueText(fragments)
+}
+
+func appendJSONText(raw json.RawMessage, depth int, out *[]string) {
+	if len(raw) == 0 || depth > 8 {
+		return
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return
+	}
+	appendStructuredText(value, depth, out)
+}
+
+func appendStructuredText(value any, depth int, out *[]string) {
+	if depth > 8 || value == nil {
+		return
+	}
+	switch typed := value.(type) {
+	case string:
+		if text := strings.TrimSpace(typed); text != "" {
+			*out = append(*out, text)
+		}
+	case []any:
+		for _, item := range typed {
+			appendStructuredText(item, depth+1, out)
+		}
+	case map[string]any:
+		for _, key := range []string{"title", "text", "value", "label", "fallbackText", "altText", "speak"} {
+			if item, ok := typed[key]; ok {
+				appendStructuredText(item, depth+1, out)
+			}
+		}
+		for _, key := range []string{"body", "items", "columns", "facts", "actions"} {
+			if item, ok := typed[key]; ok {
+				appendStructuredText(item, depth+1, out)
+			}
+		}
+	}
+}
+
+func joinUniqueText(values []string) string {
+	seen := make(map[string]struct{})
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return strings.Join(out, "\n")
+}
+
+func teamsChatDisplayName(activity *platform.Activity, chatType string) string {
+	if activity == nil {
+		return ""
+	}
+	if chatType == sdk.ChatTypeDirect {
+		return firstString(activity.Conversation.Name, activity.From.Name)
+	}
+	return firstString(activity.ChannelData.Channel.Name, activity.Conversation.Name, activity.ChannelData.Team.Name)
+}
+
+func teamsChatIdentity(activity *platform.Activity, chatType, chatID string) sdk.ChatIdentity {
+	return sdk.ChatIdentity{
+		ID:          strings.TrimSpace(chatID),
+		IDType:      "conversation_id",
+		Type:        strings.TrimSpace(chatType),
+		DisplayName: teamsChatDisplayName(activity, chatType),
+	}
+}
+
+func teamsReferencedMessage(activity *platform.Activity, chatType, chatID string) *sdk.ReferencedMessage {
+	if activity == nil || strings.TrimSpace(activity.ReplyToID) == "" {
+		return nil
+	}
+	return &sdk.ReferencedMessage{
+		Platform:    Platform,
+		MessageID:   strings.TrimSpace(activity.ReplyToID),
+		ChatType:    chatType,
+		ChatID:      strings.TrimSpace(chatID),
+		ThreadID:    strings.TrimSpace(activity.ReplyToID),
+		MessageType: "message",
+		Raw: map[string]any{
+			"fetched":     false,
+			"fetch_error": "bot connector API does not expose arbitrary activity retrieval",
+		},
+	}
 }
 
 // connectorStateStore adapts sdk.AccountStore to typed state.AccountState.
