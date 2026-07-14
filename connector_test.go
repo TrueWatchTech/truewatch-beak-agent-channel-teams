@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -55,6 +56,58 @@ func TestConnectorCredentialSchema(t *testing.T) {
 		if _, ok := schema.Properties[banned]; ok {
 			t.Fatalf("credential schema leaks backend field %q", banned)
 		}
+	}
+}
+
+func TestHandleWebhookRequestClassifiesInvalidBodyAndAuthentication(t *testing.T) {
+	c := Connector{}
+	account := teamsAccount("acct-1", "app-id")
+
+	tests := []struct {
+		name       string
+		body       []byte
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "invalid body", body: []byte(`{`), wantStatus: http.StatusBadRequest, wantCode: "invalid_request_body"},
+		{
+			name:       "oversized body",
+			body:       []byte(strings.Repeat("x", maxWebhookBodyBytes+1)),
+			wantStatus: http.StatusRequestEntityTooLarge,
+			wantCode:   "request_body_too_large",
+		},
+		{
+			name: "missing bearer token",
+			body: activityBody(teamsActivity{
+				Type:             "message",
+				ID:               "activity-1",
+				ServiceURL:       testServiceURL,
+				ConversationID:   "conversation-1",
+				ConversationType: "personal",
+				FromID:           "user-1",
+				RecipientID:      "app-id",
+			}),
+			wantStatus: http.StatusForbidden,
+			wantCode:   "channel_webhook_auth_failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(tt.body)))
+			_, err := c.HandleWebhookRequest(context.Background(), makeRuntime(&fakeSDKGateway{}, newFakeSDKAccountStore()), account, req)
+			if err == nil {
+				t.Fatal("HandleWebhookRequest() error = nil")
+			}
+			statusErr, ok := err.(interface{ HTTPStatusCode() int })
+			if !ok || statusErr.HTTPStatusCode() != tt.wantStatus {
+				t.Fatalf("webhook status error = %#v, want status %d", err, tt.wantStatus)
+			}
+			codeErr, ok := err.(interface{ ErrorCode() string })
+			if !ok || codeErr.ErrorCode() != tt.wantCode {
+				t.Fatalf("webhook error code = %#v, want %q", err, tt.wantCode)
+			}
+		})
 	}
 }
 

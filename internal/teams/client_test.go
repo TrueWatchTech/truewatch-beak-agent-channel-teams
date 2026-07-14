@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/TrueWatchTech/truewatch-beak-agent-channel-teams/sdk"
@@ -65,6 +66,77 @@ func TestClientValidate_InvalidToken(t *testing.T) {
 
 	if _, err := client.Validate(context.Background()); err == nil {
 		t.Fatal("expected error for invalid token")
+	}
+}
+
+func TestClientAppTokenCacheIsSharedAcrossClients(t *testing.T) {
+	var tokenRequests atomic.Int32
+	httpClient := &http.Client{Transport: testRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.Contains(req.URL.Path, "/oauth2/v2.0/token") {
+			tokenRequests.Add(1)
+			return jsonResp(map[string]any{"access_token": "shared-token", "expires_in": 3600})
+		}
+		t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+		return nil, nil
+	})}
+	credential := map[string]string{
+		"client_id":     "shared-cache-client",
+		"client_secret": "shared-cache-secret",
+	}
+	first := NewClient("", credential)
+	first.HTTPClient = httpClient
+	second := NewClient("", credential)
+	second.HTTPClient = httpClient
+
+	for _, client := range []*Client{first, second} {
+		token, err := client.AppToken(context.Background())
+		if err != nil {
+			t.Fatalf("AppToken() error = %v", err)
+		}
+		if token != "shared-token" {
+			t.Fatalf("AppToken() = %q, want shared-token", token)
+		}
+	}
+	if got := tokenRequests.Load(); got != 1 {
+		t.Fatalf("token requests = %d, want 1 across client instances", got)
+	}
+}
+
+func TestClientAppTokenCacheIsIsolatedByHTTPClient(t *testing.T) {
+	credential := map[string]string{
+		"client_id":     "isolated-cache-client",
+		"client_secret": "isolated-cache-secret",
+	}
+	newTokenClient := func(token string, requests *atomic.Int32) *http.Client {
+		return &http.Client{Transport: testRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if !strings.Contains(req.URL.Path, "/oauth2/v2.0/token") {
+				t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+			}
+			requests.Add(1)
+			return jsonResp(map[string]any{"access_token": token, "expires_in": 3600})
+		})}
+	}
+
+	var firstRequests atomic.Int32
+	first := NewClient("", credential)
+	first.HTTPClient = newTokenClient("first-token", &firstRequests)
+	var secondRequests atomic.Int32
+	second := NewClient("", credential)
+	second.HTTPClient = newTokenClient("second-token", &secondRequests)
+
+	firstToken, err := first.AppToken(context.Background())
+	if err != nil {
+		t.Fatalf("first AppToken() error = %v", err)
+	}
+	secondToken, err := second.AppToken(context.Background())
+	if err != nil {
+		t.Fatalf("second AppToken() error = %v", err)
+	}
+	if firstToken != "first-token" || secondToken != "second-token" {
+		t.Fatalf("tokens = %q/%q, want isolated HTTP client tokens", firstToken, secondToken)
+	}
+	if firstRequests.Load() != 1 || secondRequests.Load() != 1 {
+		t.Fatalf("token requests = %d/%d, want 1/1", firstRequests.Load(), secondRequests.Load())
 	}
 }
 

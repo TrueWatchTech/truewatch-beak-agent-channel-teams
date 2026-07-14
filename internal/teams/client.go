@@ -3,6 +3,7 @@ package teams
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -35,14 +36,23 @@ type Client struct {
 	Credential     map[string]string
 	RequestTimeout time.Duration
 	HTTPClient     *http.Client
-
-	// tokenMu guards the cached app token. The Bot Framework access token
-	// (expires_in ~3600s) is cached on the client for the lifetime of an
-	// outbound request batch; it is never written back to the credential.
-	tokenMu      sync.Mutex
-	cachedToken  string
-	tokenExpires time.Time
 }
+
+type appTokenCacheEntry struct {
+	mu        sync.Mutex
+	token     string
+	expiresAt time.Time
+}
+
+type appTokenCacheKey struct {
+	baseURL          string
+	httpClient       *http.Client
+	tenantID         string
+	clientID         string
+	clientSecretHash [sha256.Size]byte
+}
+
+var sharedAppTokenCache sync.Map
 
 func NewClient(baseURL string, credential map[string]string) *Client {
 	if strings.TrimSpace(baseURL) == "" {
@@ -101,14 +111,6 @@ func (c *Client) AppToken(ctx context.Context) (string, error) {
 }
 
 func (c *Client) acquireToken(ctx context.Context) (string, error) {
-	c.tokenMu.Lock()
-	if c.cachedToken != "" && time.Now().UTC().Before(c.tokenExpires) {
-		token := c.cachedToken
-		c.tokenMu.Unlock()
-		return token, nil
-	}
-	c.tokenMu.Unlock()
-
 	clientID := strings.TrimSpace(c.Credential["client_id"])
 	clientSecret := strings.TrimSpace(c.Credential["client_secret"])
 	if clientID == "" {
@@ -116,6 +118,14 @@ func (c *Client) acquireToken(ctx context.Context) (string, error) {
 	}
 	if clientSecret == "" {
 		return "", fmt.Errorf("teams client_secret is required")
+	}
+	cacheKey := c.appTokenCacheKey(clientID, clientSecret)
+	entryValue, _ := sharedAppTokenCache.LoadOrStore(cacheKey, &appTokenCacheEntry{})
+	entry := entryValue.(*appTokenCacheEntry)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.token != "" && time.Now().UTC().Before(entry.expiresAt) {
+		return entry.token, nil
 	}
 
 	form := url.Values{}
@@ -143,13 +153,23 @@ func (c *Client) acquireToken(ctx context.Context) (string, error) {
 	if expiresIn <= 0 {
 		expiresIn = 3600
 	}
-	c.tokenMu.Lock()
-	c.cachedToken = resp.AccessToken
-	// Refresh 60s before the real expiry to avoid using a token that lapses
-	// mid-request.
-	c.tokenExpires = time.Now().UTC().Add(time.Duration(expiresIn-60) * time.Second)
-	c.tokenMu.Unlock()
+	refreshSkew := int64(60)
+	if expiresIn <= 120 {
+		refreshSkew = expiresIn / 10
+	}
+	entry.token = resp.AccessToken
+	entry.expiresAt = time.Now().UTC().Add(time.Duration(expiresIn-refreshSkew) * time.Second)
 	return resp.AccessToken, nil
+}
+
+func (c *Client) appTokenCacheKey(clientID, clientSecret string) appTokenCacheKey {
+	return appTokenCacheKey{
+		baseURL:          strings.TrimRight(strings.TrimSpace(c.BaseURL), "/"),
+		httpClient:       c.HTTPClient,
+		tenantID:         strings.TrimSpace(c.Credential["tenant_id"]),
+		clientID:         clientID,
+		clientSecretHash: sha256.Sum256([]byte(clientSecret)),
+	}
 }
 
 // SendText acquires an app token and posts a message Activity to

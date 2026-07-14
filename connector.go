@@ -279,32 +279,36 @@ func (Connector) Stop(ctx context.Context, account sdk.ChannelAccount) error {
 // Go error so the gateway can reject with 403.
 func (c Connector) HandleWebhookRequest(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, req *http.Request) (*sdk.WebhookResponse, error) {
 	if req == nil || req.Body == nil {
-		return nil, fmt.Errorf("%s webhook request body is required", Platform)
+		return nil, teamsWebhookError(http.StatusBadRequest, "invalid_request_body", fmt.Errorf("%s webhook request body is required", Platform))
 	}
 	body, err := io.ReadAll(io.LimitReader(req.Body, maxWebhookBodyBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("%s read webhook body: %w", Platform, err)
+		return nil, teamsWebhookError(http.StatusBadRequest, "invalid_request_body", fmt.Errorf("%s read webhook body: %w", Platform, err))
 	}
 	if len(body) > maxWebhookBodyBytes {
-		return nil, fmt.Errorf("%s webhook body exceeds %d bytes", Platform, maxWebhookBodyBytes)
+		return nil, teamsWebhookError(http.StatusRequestEntityTooLarge, "request_body_too_large", fmt.Errorf("%s webhook body exceeds %d bytes", Platform, maxWebhookBodyBytes))
 	}
 
 	var activity platform.Activity
 	if err := json.Unmarshal(body, &activity); err != nil {
-		return nil, fmt.Errorf("%s decode webhook activity: %w", Platform, err)
+		return nil, teamsWebhookError(http.StatusBadRequest, "invalid_request_body", fmt.Errorf("%s decode webhook activity: %w", Platform, err))
 	}
 
 	expectedAudience := firstString(account.Credential["client_id"], account.Credential["bot_id"], account.Credential["account_id"])
 	provider := platform.SharedJWKSProvider(runtime.HTTPClient)
 	if err := platform.VerifyWebhookToken(ctx, provider, req.Header.Get("Authorization"), expectedAudience, activity.ServiceURL, activity.ChannelID, time.Now().UTC()); err != nil {
-		return nil, err
+		return nil, teamsWebhookError(http.StatusForbidden, "channel_webhook_auth_failed", err)
 	}
 
 	if _, err := c.HandleWebhook(ctx, runtime, account, body); err != nil {
-		return nil, err
+		return nil, teamsWebhookError(http.StatusInternalServerError, "channel_webhook_failed", err)
 	}
 	// Bot Framework only requires a 2xx; the body is ignored for activities.
 	return &sdk.WebhookResponse{StatusCode: http.StatusOK}, nil
+}
+
+func teamsWebhookError(statusCode int, errorCode string, err error) error {
+	return &sdk.WebhookError{StatusCode: statusCode, Code: errorCode, Err: err}
 }
 
 // HandleWebhook parses an already-verified Bot Framework activity body and runs
