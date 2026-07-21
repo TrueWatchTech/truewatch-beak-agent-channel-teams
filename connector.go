@@ -17,9 +17,11 @@ import (
 )
 
 const (
-	ID                  = "beak-agent-teams"
-	Platform            = "teams"
-	maxWebhookBodyBytes = 4 << 20
+	ID                             = "beak-agent-teams"
+	Platform                       = "teams"
+	maxWebhookBodyBytes            = 4 << 20
+	credentialValidationAttempts   = 2
+	credentialValidationRetryDelay = 100 * time.Millisecond
 )
 
 var ErrCredentialLogin = errors.New("teams connector uses credential login; create channel account from CredentialSchema")
@@ -103,23 +105,12 @@ func (Connector) ValidateCredential(ctx context.Context, req sdk.CredentialValid
 	client := platform.NewClient("", credentialStrings(credential))
 	client.HTTPClient = req.Runtime.HTTPClient
 
-	info, err := client.Validate(ctx)
+	info, err := validateTeamsCredential(ctx, client)
 	if err != nil {
-		return &sdk.CredentialValidationResult{
-			Valid:       false,
-			AccountKey:  firstString(credential["account_id"], credential["client_id"], credential["bot_id"]),
-			DisplayName: firstString(credential["display_name"], credential["client_id"], credential["account_id"]),
-			Credential:  credential,
-			State:       stateMap,
-			Metadata: map[string]any{
-				"platform": Platform,
-				// A valid credential proves the app registration only; it does
-				// not prove the bot is installed in any team/chat.
-				"install_required": true,
-				"validation_scope": "credential_only",
-			},
-			Error: err.Error(),
-		}, nil
+		if platform.IsCredentialRejected(err) {
+			return credentialValidationFailure(credential, stateMap, err), nil
+		}
+		return nil, fmt.Errorf("teams credential validation failed: %w", err)
 	}
 
 	credential["account_id"] = info.AccountID
@@ -152,6 +143,55 @@ func (Connector) ValidateCredential(ctx context.Context, req sdk.CredentialValid
 			"validation_scope": "credential_only",
 		},
 	}, nil
+}
+
+func validateTeamsCredential(ctx context.Context, client *platform.Client) (*platform.BotInfo, error) {
+	var lastErr error
+	for attempt := 0; attempt < credentialValidationAttempts; attempt++ {
+		info, err := client.Validate(ctx)
+		if err == nil {
+			return info, nil
+		}
+		lastErr = err
+		if platform.IsCredentialRejected(err) || !platform.IsRetryableError(err) || attempt+1 == credentialValidationAttempts {
+			break
+		}
+		if err := waitForCredentialRetry(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func credentialValidationFailure(credential, stateMap map[string]any, err error) *sdk.CredentialValidationResult {
+	message := ""
+	if err != nil {
+		message = err.Error()
+	}
+	return &sdk.CredentialValidationResult{
+		Valid:       false,
+		AccountKey:  firstString(credential["account_id"], credential["client_id"], credential["bot_id"]),
+		DisplayName: firstString(credential["display_name"], credential["client_id"], credential["account_id"]),
+		Credential:  credential,
+		State:       stateMap,
+		Metadata: map[string]any{
+			"platform":         Platform,
+			"install_required": true,
+			"validation_scope": "credential_only",
+		},
+		Error: message,
+	}
+}
+
+func waitForCredentialRetry(ctx context.Context) error {
+	timer := time.NewTimer(credentialValidationRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (Connector) StartLogin(context.Context, sdk.LoginStartRequest) (*sdk.LoginChallenge, error) {
@@ -242,9 +282,6 @@ func (Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbound
 	replyToID := firstString(req.ThreadID, req.Raw["reply_to_id"], req.Raw["replyToId"], req.Raw["thread_id"])
 	messageID, err := client.SendText(ctx, serviceURL, req.ChatID, replyToID, req.Text, req.Format, req.Mentions, req.MentionAll)
 	if err != nil {
-		return nil, err
-	}
-	if err := store.SaveAccount(ctx, st); err != nil {
 		return nil, err
 	}
 	return &sdk.SendResult{

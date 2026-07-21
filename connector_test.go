@@ -3,6 +3,7 @@ package beakteams
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -187,6 +188,66 @@ func TestValidateCredential_HTTPClientInjected(t *testing.T) {
 	}
 	if sawMethod != http.MethodPost {
 		t.Fatalf("expected POST, saw %q", sawMethod)
+	}
+}
+
+func TestValidateCredential_TransientErrorRetriesThenReturnsGoError(t *testing.T) {
+	var calls int
+	client := &http.Client{Transport: testRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		response, err := testJSONResponse(map[string]any{"error": "server_error"})
+		response.StatusCode = http.StatusServiceUnavailable
+		return response, err
+	})}
+	result, err := (Connector{}).ValidateCredential(context.Background(), sdk.CredentialValidationRequest{
+		Credential: map[string]any{"client_id": "teams-transient", "client_secret": "secret-transient"},
+		Runtime:    sdk.Runtime{HTTPClient: client},
+	})
+	if err == nil || result != nil || !strings.Contains(err.Error(), "503") {
+		t.Fatalf("result=%+v error=%v, want transient Go error", result, err)
+	}
+	if calls != credentialValidationAttempts {
+		t.Fatalf("calls=%d, want %d", calls, credentialValidationAttempts)
+	}
+}
+
+func TestValidateCredential_TransientErrorCanRecover(t *testing.T) {
+	var calls int
+	client := &http.Client{Transport: testRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			response, err := testJSONResponse(map[string]any{"error": "server_error"})
+			response.StatusCode = http.StatusServiceUnavailable
+			return response, err
+		}
+		return testJSONResponse(tokenOK())
+	})}
+	result, err := (Connector{}).ValidateCredential(context.Background(), sdk.CredentialValidationRequest{
+		Credential: map[string]any{"client_id": "teams-retry", "client_secret": "secret-retry"},
+		Runtime:    sdk.Runtime{HTTPClient: client},
+	})
+	if err != nil || result == nil || !result.Valid || calls != 2 {
+		t.Fatalf("result=%+v error=%v calls=%d", result, err, calls)
+	}
+}
+
+func TestValidateCredential_TransientOAuthResponseReturnsGoError(t *testing.T) {
+	var calls int
+	client := &http.Client{Transport: testRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		response, err := testJSONResponse(map[string]any{"error": "temporarily_unavailable", "error_description": "retry later"})
+		response.StatusCode = http.StatusBadRequest
+		return response, err
+	})}
+	result, err := (Connector{}).ValidateCredential(context.Background(), sdk.CredentialValidationRequest{
+		Credential: map[string]any{"client_id": "teams-transient-body", "client_secret": "secret-transient-body"},
+		Runtime:    sdk.Runtime{HTTPClient: client},
+	})
+	if err == nil || result != nil || !strings.Contains(err.Error(), "retry later") {
+		t.Fatalf("result=%+v error=%v, want transient Go error", result, err)
+	}
+	if calls != credentialValidationAttempts {
+		t.Fatalf("calls=%d, want %d", calls, credentialValidationAttempts)
 	}
 }
 
@@ -442,6 +503,41 @@ func TestSend_Text(t *testing.T) {
 	if res.MessageID != "act-1" {
 		t.Fatalf("message id=%q want act-1", res.MessageID)
 	}
+}
+
+func TestSend_DoesNotSaveUnchangedStateAfterPlatformSuccess(t *testing.T) {
+	account := teamsAccount("acct-nosave", "bot-nosave")
+	store := &failingSaveAccountStore{state: map[string]any{
+		"service_urls": map[string]any{"C1": testServiceURL},
+	}}
+	rt := makeRuntime(&fakeSDKGateway{}, store, account)
+	rt.HTTPClient = &http.Client{Transport: testRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.Contains(req.URL.Path, "/oauth2/v2.0/token") {
+			return testJSONResponse(tokenOK())
+		}
+		return testJSONResponse(map[string]any{"id": "act-nosave"})
+	})}
+	result, err := (Connector{}).Send(context.Background(), rt, sdk.OutboundMessage{AccountUUID: account.UUID, ChatID: "C1", Text: "hi"})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if result.MessageID != "act-nosave" || store.saveCalls != 0 {
+		t.Fatalf("result=%+v saveCalls=%d", result, store.saveCalls)
+	}
+}
+
+type failingSaveAccountStore struct {
+	state     map[string]any
+	saveCalls int
+}
+
+func (s *failingSaveAccountStore) LoadChannelAccountState(context.Context, string) (map[string]any, error) {
+	return s.state, nil
+}
+
+func (s *failingSaveAccountStore) SaveChannelAccountState(context.Context, string, map[string]any) error {
+	s.saveCalls++
+	return errors.New("state save failed")
 }
 
 func TestSend_ThreadAndMentionMappedToTeamsActivity(t *testing.T) {

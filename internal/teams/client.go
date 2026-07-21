@@ -90,7 +90,7 @@ func (c *Client) tokenPath() string {
 func (c *Client) Validate(ctx context.Context) (*BotInfo, error) {
 	clientID := strings.TrimSpace(c.Credential["client_id"])
 	if clientID == "" {
-		return nil, fmt.Errorf("teams client_id is required")
+		return nil, credentialRejected("teams client_id is required")
 	}
 	if _, err := c.acquireToken(ctx); err != nil {
 		return nil, err
@@ -114,10 +114,10 @@ func (c *Client) acquireToken(ctx context.Context) (string, error) {
 	clientID := strings.TrimSpace(c.Credential["client_id"])
 	clientSecret := strings.TrimSpace(c.Credential["client_secret"])
 	if clientID == "" {
-		return "", fmt.Errorf("teams client_id is required")
+		return "", credentialRejected("teams client_id is required")
 	}
 	if clientSecret == "" {
-		return "", fmt.Errorf("teams client_secret is required")
+		return "", credentialRejected("teams client_secret is required")
 	}
 	cacheKey := c.appTokenCacheKey(clientID, clientSecret)
 	entryValue, _ := sharedAppTokenCache.LoadOrStore(cacheKey, &appTokenCacheEntry{})
@@ -136,9 +136,19 @@ func (c *Client) acquireToken(ctx context.Context) (string, error) {
 
 	var resp tokenResponse
 	if err := c.doForm(ctx, c.tokenPath(), form, &resp); err != nil {
+		message := resp.ErrorDescription
+		if message == "" {
+			message = resp.Error
+		}
+		if oauthCredentialRejected(resp.Error) {
+			return "", credentialRejected(message)
+		}
+		if oauthTransientFailure(resp.Error) {
+			return "", transientFailureWithCause("teams token: "+message, err)
+		}
 		return "", err
 	}
-	if resp.Error != "" || resp.AccessToken == "" {
+	if resp.Error != "" {
 		msg := resp.ErrorDescription
 		if msg == "" {
 			msg = resp.Error
@@ -146,7 +156,16 @@ func (c *Client) acquireToken(ctx context.Context) (string, error) {
 		if msg == "" {
 			msg = "token acquisition failed"
 		}
+		if oauthCredentialRejected(resp.Error) {
+			return "", credentialRejected("teams token: " + msg)
+		}
+		if oauthTransientFailure(resp.Error) {
+			return "", transientFailure("teams token: " + msg)
+		}
 		return "", fmt.Errorf("teams token: %s", msg)
+	}
+	if resp.AccessToken == "" {
+		return "", transientFailure("teams token: token acquisition returned no access_token")
 	}
 
 	expiresIn := resp.ExpiresIn
@@ -332,10 +351,12 @@ func (c *Client) doForm(ctx context.Context, path string, form url.Values, out a
 	if out != nil && len(bytes.TrimSpace(data)) > 0 {
 		// Decode regardless of status so the caller can surface the OAuth2
 		// error/error_description on a non-2xx response.
-		_ = json.Unmarshal(data, out)
+		if err := json.Unmarshal(data, out); err != nil {
+			return transientFailure(fmt.Sprintf("decode token response: %v", err))
+		}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("POST %s failed: status=%d body=%s", path, resp.StatusCode, string(data))
+		return &HTTPError{StatusCode: resp.StatusCode, Method: http.MethodPost, Path: path, Body: string(data)}
 	}
 	return nil
 }
