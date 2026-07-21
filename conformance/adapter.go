@@ -204,6 +204,37 @@ func (a *adapter) Acknowledge(ctx context.Context, req conformance.OutboundAck) 
 	}, nil
 }
 
+func (a *adapter) Send(ctx context.Context, req conformance.OutboundMessage) (*conformance.SendResult, error) {
+	account := sdk.ChannelAccount{
+		UUID: req.AccountUUID, Platform: "teams",
+		Credential: map[string]any{
+			"account_id": req.AccountUUID, "client_id": "app-id", "client_secret": "secret",
+		},
+		State: map[string]any{
+			"service_urls": map[string]any{req.ChatID: "https://smba.trafficmanager.net/amer/"},
+		},
+	}
+	store := newFakeAccountStore()
+	if err := store.SaveChannelAccountState(ctx, account.UUID, account.State); err != nil {
+		return nil, err
+	}
+	result, err := a.conn.Send(ctx, sdk.Runtime{
+		Account: account, Accounts: []sdk.ChannelAccount{account},
+		AccountStore: store, HTTPClient: fakeAuthClient(),
+	}, sdk.OutboundMessage{
+		WorkspaceUUID: req.WorkspaceUUID, Platform: req.Platform, AccountUUID: req.AccountUUID,
+		ChannelUUID: req.ChannelUUID, SessionUUID: req.SessionUUID, MessageUUID: req.MessageUUID,
+		ChatType: req.ChatType, ChatID: req.ChatID, ThreadID: req.ThreadID, Text: req.Text,
+		Format: req.Format, Title: req.Title, Mentions: sdkMentions(req.Mentions), MentionAll: req.MentionAll, Raw: req.Raw,
+	})
+	if result == nil {
+		return nil, err
+	}
+	return &conformance.SendResult{
+		Platform: result.Platform, AccountUUID: result.AccountUUID, MessageID: result.MessageID, Raw: result.Raw,
+	}, err
+}
+
 func convertMentions(mentions []sdk.MentionIdentity) []conformance.MentionIdentity {
 	if len(mentions) == 0 {
 		return nil
@@ -215,11 +246,25 @@ func convertMentions(mentions []sdk.MentionIdentity) []conformance.MentionIdenti
 	return out
 }
 
+func sdkMentions(mentions []conformance.MentionIdentity) []sdk.MentionIdentity {
+	if len(mentions) == 0 {
+		return nil
+	}
+	out := make([]sdk.MentionIdentity, len(mentions))
+	for i, mention := range mentions {
+		out[i] = sdk.MentionIdentity{ID: mention.ID, IDType: mention.IDType, DisplayName: mention.DisplayName}
+	}
+	return out
+}
+
 // fakeAuthClient stubs the Microsoft Teams credential-validation endpoint so
 // ValidateCredential can run without a real network call.
 func fakeAuthClient() *http.Client {
-	return &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+	return &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		body := `{"access_token":"app-token","token_type":"Bearer","expires_in":3600}`
+		if strings.Contains(req.URL.Path, "/v3/conversations/") && strings.HasSuffix(req.URL.Path, "/activities") {
+			body = `{"id":"activity-conformance"}`
+		}
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
